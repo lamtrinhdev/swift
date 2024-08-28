@@ -34,7 +34,9 @@
 #include "DerivedConformances.h"
 #include "TypeAccessScopeChecker.h"
 #include "TypeChecker.h"
+#include "TypeCheckType.h"
 
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/NameLookupRequests.h"
@@ -191,7 +193,7 @@ checkTypeWitness(Type type, AssociatedTypeDecl *assocType,
 
   // Check protocol conformances. We don't check conditional requirements here.
   for (const auto reqProto : sig->getRequiredProtocols(depTy)) {
-    if (ModuleDecl::lookupConformance(
+    if (lookupConformance(
             type, reqProto,
             /*allowMissing=*/reqProto->isSpecificProtocol(
                 KnownProtocolKind::Sendable))
@@ -329,7 +331,18 @@ static void recordTypeWitness(NormalProtocolConformance *conformance,
 
     // Construct the availability of the type witnesses based on the
     // availability of the enclosing type and the associated type.
-    const Decl *availabilitySources[2] = { dc->getAsDecl(), assocType };
+    llvm::SmallVector<Decl *, 2> availabilitySources = {dc->getAsDecl()};
+
+    // Only constrain the availability of the typealias by the availability of
+    // the associated type if the associated type is less available than its
+    // protocol. This is required for source compatibility.
+    auto protoAvailability = AvailabilityInference::availableRange(proto, ctx);
+    auto assocTypeAvailability =
+        AvailabilityInference::availableRange(assocType, ctx);
+    if (protoAvailability.isSupersetOf(assocTypeAvailability)) {
+      availabilitySources.push_back(assocType);
+    }
+
     AvailabilityInference::applyInferredAvailableAttrs(
         aliasDecl, availabilitySources, ctx);
 
@@ -341,6 +354,22 @@ static void recordTypeWitness(NormalProtocolConformance *conformance,
     }
 
     typeDecl = aliasDecl;
+  }
+
+  // If we're disallowing unsafe code, check for an unsafe type witness.
+  if (ctx.LangOpts.hasFeature(Feature::WarnUnsafe) &&
+      !assocType->isUnsafe() && type->isUnsafe()) {
+    SourceLoc loc = typeDecl->getLoc();
+    if (loc.isInvalid())
+      loc = conformance->getLoc();
+    diagnoseUnsafeType(ctx,
+                       loc,
+                       type,
+                       [&](Type specificType) {
+      ctx.Diags.diagnose(
+          loc, diag::type_witness_unsafe, specificType, assocType->getName());
+      assocType->diagnose(diag::decl_declared_here, assocType);
+    });
   }
 
   // Record the type witness.
@@ -360,9 +389,9 @@ static void recordTypeWitness(NormalProtocolConformance *conformance,
 
     // Find the conformance for this overridden protocol.
     auto overriddenConformance =
-      ModuleDecl::lookupConformance(dc->getSelfInterfaceType(),
-                                    overridden->getProtocol(),
-                                    /*allowMissing=*/true);
+      lookupConformance(dc->getSelfInterfaceType(),
+                        overridden->getProtocol(),
+                        /*allowMissing=*/true);
     if (overriddenConformance.isInvalid() ||
         !overriddenConformance.isConcrete())
       continue;
@@ -1384,7 +1413,7 @@ static bool isExtensionUsableForInference(const ExtensionDecl *extension,
   // so won't be affected by whatever answer inference comes up with.
   auto checkConformance = [&](ProtocolDecl *proto) {
     auto typeInContext = conformanceDC->mapTypeIntoContext(conformance->getType());
-    auto otherConf = ModuleDecl::checkConformance(typeInContext, proto);
+    auto otherConf = swift::checkConformance(typeInContext, proto);
     return !otherConf.isInvalid();
   };
 
@@ -4493,7 +4522,7 @@ AssociatedConformanceRequest::evaluate(Evaluator &eval,
   if (substTy->hasTypeParameter())
     substTy = conformance->getDeclContext()->mapTypeIntoContext(substTy);
 
-  return ModuleDecl::lookupConformance(substTy, reqProto, /*allowMissing=*/true)
+  return lookupConformance(substTy, reqProto, /*allowMissing=*/true)
       .mapConformanceOutOfContext();
 }
 

@@ -233,7 +233,8 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
   } else {
     serializationOpts.ExtraClangOptions = getClangImporterOptions().ExtraArgs;
   }
-  if (LangOpts.ClangTarget) {
+  if (LangOpts.ClangTarget &&
+      !getClangImporterOptions().DirectClangCC1ModuleBuild) {
     serializationOpts.ExtraClangOptions.push_back("--target=" +
                                                   LangOpts.ClangTarget->str());
   }
@@ -572,6 +573,10 @@ bool CompilerInstance::setup(const CompilerInvocation &Invoke,
   const auto &LangOpts = Invocation.getLangOptions();
   if (LangOpts.EnableModuleLoadingRemarks) {
     Invocation.getSearchPathOptions().dump(LangOpts.Target.isOSDarwin());
+  }
+
+  if (LangOpts.OpenSourcesAsVolatile) {
+    this->getSourceMgr().setOpenSourcesAsVolatile();
   }
 
   // If we expect an implicit stdlib import, load in the standard library. If we
@@ -1465,6 +1470,8 @@ ModuleDecl *CompilerInstance::getMainModule() const {
     if (Invocation.getLangOptions().EnableCXXInterop &&
         Invocation.getLangOptions().RequireCxxInteropToImportCxxInteropModule)
       MainModule->setHasCxxInteroperability();
+    if (Invocation.getLangOptions().EnableCXXInterop)
+      MainModule->setCXXStdlibKind(Invocation.getLangOptions().CXXStdlib);
     if (Invocation.getLangOptions().AllowNonResilientAccess)
       MainModule->setAllowNonResilientAccess();
     if (Invocation.getSILOptions().EnableSerializePackage)

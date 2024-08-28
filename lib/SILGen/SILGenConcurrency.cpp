@@ -16,6 +16,7 @@
 #include "Scope.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Availability.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DistributedDecl.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/Basic/Assertions.h"
@@ -297,8 +298,8 @@ emitDistributedActorIsolation(SILGenFunction &SGF, SILLocation loc,
                               ManagedValue actor, CanType actorType) {
   // First, open the actor type if it's an existential type.
   if (actorType->isExistentialType()) {
-    CanType openedType = OpenedArchetypeType::getAny(actorType,
-                                                     SGF.F.getGenericSignature());
+    CanType openedType = OpenedArchetypeType::getAny(actorType)
+        ->getCanonicalType();
     SILType loweredOpenedType = SGF.getLoweredType(openedType);
 
     actor = SGF.emitOpenExistential(loc, actor, loweredOpenedType,
@@ -315,7 +316,7 @@ emitDistributedActorIsolation(SILGenFunction &SGF, SILLocation loc,
   // simple case that it's okay.
   auto sig = distributedActorProto->getGenericSignature();
   auto distributedActorConf =
-    ModuleDecl::lookupConformance(actorType, distributedActorProto);
+    lookupConformance(actorType, distributedActorProto);
   auto distributedActorSubs = SubstitutionMap::get(sig, {actorType},
                                                    {distributedActorConf});
 

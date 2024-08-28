@@ -507,6 +507,7 @@ SwiftDependencyScanningService::SwiftDependencyScanningService() {
       /* CAS (llvm::cas::ObjectStore) */ nullptr,
       /* Cache (llvm::cas::ActionCache) */ nullptr,
       /* SharedFS */ nullptr);
+  SharedFilesystemCache.emplace();
 }
 
 bool
@@ -540,11 +541,11 @@ void
 swift::dependencies::registerCxxInteropLibraries(
     const llvm::Triple &Target,
     StringRef mainModuleName,
-    bool hasStaticCxx, bool hasStaticCxxStdlib,
+    bool hasStaticCxx, bool hasStaticCxxStdlib, CXXStdlibKind cxxStdlibKind,
     std::function<void(const LinkLibrary&)> RegistrationCallback) {
-  if (Target.isOSDarwin())
+  if (cxxStdlibKind == CXXStdlibKind::Libcxx)
     RegistrationCallback(LinkLibrary("c++", LibraryKind::Library));
-  else if (Target.isOSLinux())
+  else if (cxxStdlibKind == CXXStdlibKind::Libstdcxx)
     RegistrationCallback(LinkLibrary("stdc++", LibraryKind::Library));
 
   // Do not try to link Cxx with itself.
@@ -611,10 +612,11 @@ swift::dependencies::registerBackDeployLibraries(
 }
 
 void SwiftDependencyTracker::addCommonSearchPathDeps(
-    const SearchPathOptions &Opts) {
+    const CompilerInvocation &CI) {
+  auto &SearchPathOpts = CI.getSearchPathOptions();
   // Add SDKSetting file.
   SmallString<256> SDKSettingPath;
-  llvm::sys::path::append(SDKSettingPath, Opts.getSDKPath(),
+  llvm::sys::path::append(SDKSettingPath, SearchPathOpts.getSDKPath(),
                           "SDKSettings.json");
   FS->status(SDKSettingPath);
 
@@ -623,7 +625,7 @@ void SwiftDependencyTracker::addCommonSearchPathDeps(
       "arm64", "arm64e", "x86_64", "i386",
       "armv7", "armv7s", "armv7k", "arm64_32"};
 
-  for (auto RuntimeLibPath : Opts.RuntimeLibraryPaths) {
+  for (auto RuntimeLibPath : SearchPathOpts.RuntimeLibraryPaths) {
     std::error_code EC;
     for (auto &Arch : AllSupportedArches) {
       SmallString<256> LayoutFile(RuntimeLibPath);
@@ -633,8 +635,12 @@ void SwiftDependencyTracker::addCommonSearchPathDeps(
   }
 
   // Add VFSOverlay file.
-  for (auto &Overlay: Opts.VFSOverlayFiles)
+  for (auto &Overlay: SearchPathOpts.VFSOverlayFiles)
     FS->status(Overlay);
+
+  // Add blocklist file.
+  for (auto &File: CI.getFrontendOptions().BlocklistConfigFilePaths)
+    FS->status(File);
 }
 
 void SwiftDependencyTracker::startTracking() {
@@ -735,6 +741,7 @@ bool SwiftDependencyScanningService::setupCachingDependencyScanningService(
 
 SwiftDependencyScanningService::ContextSpecificGlobalCacheState *
 SwiftDependencyScanningService::getCacheForScanningContextHash(StringRef scanningContextHash) const {
+  llvm::sys::SmartScopedLock<true> Lock(ScanningServiceGlobalLock);
   auto contextSpecificCache = ContextSpecificCacheMap.find(scanningContextHash);
   assert(contextSpecificCache != ContextSpecificCacheMap.end() &&
          "Global Module Dependencies Cache not configured with context-specific "
@@ -755,7 +762,6 @@ SwiftDependencyScanningService::getDependenciesMap(
 ModuleNameToDependencyMap &
 SwiftDependencyScanningService::getDependenciesMap(
     ModuleDependencyKind kind, StringRef scanContextHash) {
-  llvm::sys::SmartScopedLock<true> Lock(ScanningServiceGlobalLock);
   auto contextSpecificCache = getCacheForScanningContextHash(scanContextHash);
   auto it = contextSpecificCache->ModuleDependenciesMap.find(kind);
   assert(it != contextSpecificCache->ModuleDependenciesMap.end() &&

@@ -22,6 +22,7 @@
 #include "swift/AST/Attr.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsClangImporter.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -2655,7 +2656,8 @@ namespace {
       // FIXME: https://github.com/apple/swift/issues/73037
       if (decl->getDeclContext()->isNamespace() &&
           decl->getDeclContext()->getParent()->isStdNamespace() &&
-          decl->getIdentifier() && decl->getName() == "tzdb")
+          decl->getIdentifier() &&
+          (decl->getName() == "tzdb" || decl->getName() == "time_zone_link"))
         return nullptr;
 
       auto &clangSema = Impl.getClangSema();
@@ -8072,7 +8074,7 @@ ClangImporter::Implementation::importSwiftAttrAttributes(Decl *MappedDecl) {
 
         // Don't synthesize a conformance if one already exists.
         auto ty = nominal->getDeclaredInterfaceType();
-        if (ModuleDecl::lookupConformance(ty, protocol))
+        if (lookupConformance(ty, protocol))
           continue;
         auto conformance = SwiftContext.getNormalConformance(
             ty, protocol, nominal->getLoc(), nominal->getDeclContextForModule(),
@@ -8100,6 +8102,14 @@ ClangImporter::Implementation::importSwiftAttrAttributes(Decl *MappedDecl) {
         if (!SwiftContext.LangOpts.hasFeature(Feature::Sensitive))
           continue;
         auto attr = new (SwiftContext) SensitiveAttr(/*implicit=*/true);
+        MappedDecl->getAttrs().add(attr);
+        continue;
+      }
+
+      if (swiftAttr->getAttribute() == "unsafe") {
+        if (!SwiftContext.LangOpts.hasFeature(Feature::AllowUnsafeAttribute))
+          continue;
+        auto attr = new (SwiftContext) UnsafeAttr(/*implicit=*/false);
         MappedDecl->getAttrs().add(attr);
         continue;
       }

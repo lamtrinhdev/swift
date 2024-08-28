@@ -48,6 +48,7 @@ int swift_ASTGen_roundTripCheck(void *_Nonnull sourceFile);
 /// Emit parser diagnostics for given source file.. Returns non-zero if any
 /// diagnostics were emitted.
 int swift_ASTGen_emitParserDiagnostics(
+    BridgedASTContext astContext,
     void *_Nonnull diagEngine, void *_Nonnull sourceFile, int emitOnlyErrors,
     int downgradePlaceholderErrorsToWarnings);
 
@@ -150,6 +151,13 @@ bool swift_ASTGen_parseRegexLiteral(BridgedStringRef inputPtr,
                                     size_t captureStructureSize,
                                     BridgedSourceLoc diagLoc,
                                     BridgedDiagnosticEngine diagEngine);
+
+intptr_t swift_ASTGen_configuredRegions(
+    BridgedASTContext astContext,
+    void *_Nonnull sourceFile,
+    BridgedIfConfigClauseRangeInfo *_Nullable *_Nonnull);
+void swift_ASTGen_freeConfiguredRegions(
+    BridgedIfConfigClauseRangeInfo *_Nullable regions, intptr_t numRegions);
 
 #ifdef __cplusplus
 }

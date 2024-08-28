@@ -17,6 +17,7 @@
 #include "GenArchetype.h"
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
@@ -78,7 +79,7 @@ irgen::emitArchetypeTypeMetadataRef(IRGenFunction &IGF,
   }
 
 #ifndef NDEBUG
-  if (!archetype->getParent()) {
+  if (archetype->isRoot()) {
     llvm::errs() << "Metadata for archetype not bound in function.\n"
                  << "  The metadata could be missing entirely because it needs "
                     "to be passed to the function.\n"
@@ -97,12 +98,12 @@ irgen::emitArchetypeTypeMetadataRef(IRGenFunction &IGF,
   }
 #endif
   // If there's no local or opaque metadata, it must be a nested type.
-  assert(archetype->getParent() && "Not a nested archetype");
+  auto *member = archetype->getInterfaceType()->castTo<DependentMemberType>();
 
-  CanArchetypeType parent(archetype->getParent());
-  AssociatedType association(
-      archetype->getInterfaceType()->castTo<DependentMemberType>()
-        ->getAssocType());
+  auto parent = cast<ArchetypeType>(
+    archetype->getGenericEnvironment()->mapTypeIntoContext(
+      member->getBase())->getCanonicalType());
+  AssociatedType association(member->getAssocType());
 
   MetadataResponse response =
     emitAssociatedTypeMetadataRef(IGF, parent, association, request);
@@ -415,7 +416,7 @@ const TypeInfo *TypeConverter::convertArchetypeType(ArchetypeType *archetype) {
       IGM.getSwiftModule()->getASTContext().getProtocol(
           KnownProtocolKind::BitwiseCopyable);
   // The protocol won't be present in swiftinterfaces from older SDKs.
-  if (bitwiseCopyableProtocol && ModuleDecl::checkConformance(
+  if (bitwiseCopyableProtocol && checkConformance(
                                      archetype, bitwiseCopyableProtocol)) {
     return BitwiseCopyableTypeInfo::create(storageType, abiAccessible);
   }

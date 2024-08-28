@@ -405,8 +405,13 @@ InFlightDiagnostic::limitBehaviorUntilSwiftVersion(
     // in a message that this will become an error in a later Swift
     // version. We do this before limiting the behavior, because
     // wrapIn will result in the behavior of the wrapping diagnostic.
-    if (limit >= DiagnosticBehavior::Warning)
-      wrapIn(diag::error_in_future_swift_version, majorVersion);
+    if (limit >= DiagnosticBehavior::Warning) {
+      if (majorVersion > 6) {
+        wrapIn(diag::error_in_a_future_swift_version);
+      } else {
+        wrapIn(diag::error_in_future_swift_version, majorVersion);
+      }
+    }
 
     limitBehavior(limit);
   }
@@ -613,11 +618,11 @@ static bool isInterestingTypealias(Type type) {
 /// declaration and end up presenting the parameter in τ_0_0 format on
 /// diagnostic.
 static Type getAkaTypeForDisplay(Type type) {
-  return type.transform([](Type visitTy) -> Type {
-    if (isa<SugarType>(visitTy.getPointer()) &&
-        !isa<GenericTypeParamType>(visitTy.getPointer()))
+  return type.transformRec([&](TypeBase *visitTy) -> std::optional<Type> {
+    if (isa<SugarType>(visitTy) &&
+        !isa<GenericTypeParamType>(visitTy))
       return getAkaTypeForDisplay(visitTy->getDesugaredType());
-    return visitTy;
+    return std::nullopt;
   });
 }
 
@@ -1012,8 +1017,16 @@ static void formatDiagnosticArgument(StringRef Modifier,
         << FormatOpts.ClosingQuotationMark;
     break;
   case DiagnosticArgumentKind::ActorIsolation: {
-    assert(Modifier.empty() && "Improper modifier for ActorIsolation argument");
+    assert((Modifier.empty() || Modifier == "noun") &&
+           "Improper modifier for ActorIsolation argument");
     auto isolation = Arg.getAsActorIsolation();
+    isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark,
+                                  /*asNoun*/ Modifier == "noun");
+    break;
+  }
+  case DiagnosticArgumentKind::IsolationSource: {
+    assert(Modifier.empty() && "Improper modifier for IsolationSource argument");
+    auto isolation = Arg.getAsIsolationSource();
     isolation.printForDiagnostics(Out, FormatOpts.OpeningQuotationMark);
     break;
   }

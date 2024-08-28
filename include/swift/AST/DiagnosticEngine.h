@@ -50,6 +50,7 @@ namespace swift {
   class ValueDecl;
   class SourceFile;
 
+  enum class CXXStdlibKind : uint8_t;
   enum class DescriptivePatternKind : uint8_t;
   enum class SelfAccessKind : uint8_t;
   enum class ReferenceOwnership : uint8_t;
@@ -140,6 +141,7 @@ namespace swift {
     VersionTuple,
     LayoutConstraint,
     ActorIsolation,
+    IsolationSource,
     Diagnostic,
     ClangDecl
   };
@@ -175,6 +177,7 @@ namespace swift {
       llvm::VersionTuple VersionVal;
       LayoutConstraint LayoutConstraintVal;
       ActorIsolation ActorIsolationVal;
+      IsolationSource IsolationSourceVal;
       DiagnosticInfo *DiagnosticVal;
       const clang::NamedDecl *ClangDecl;
     };
@@ -281,6 +284,11 @@ namespace swift {
     DiagnosticArgument(ActorIsolation AI)
       : Kind(DiagnosticArgumentKind::ActorIsolation),
         ActorIsolationVal(AI) {
+    }
+
+    DiagnosticArgument(IsolationSource IS)
+      : Kind(DiagnosticArgumentKind::IsolationSource),
+        IsolationSourceVal(IS){
     }
 
     DiagnosticArgument(DiagnosticInfo *D)
@@ -402,6 +410,11 @@ namespace swift {
       return ActorIsolationVal;
     }
 
+    IsolationSource getAsIsolationSource() const {
+      assert(Kind == DiagnosticArgumentKind::IsolationSource);
+      return IsolationSourceVal;
+    }
+
     DiagnosticInfo *getAsDiagnostic() const {
       assert(Kind == DiagnosticArgumentKind::Diagnostic);
       return DiagnosticVal;
@@ -415,14 +428,29 @@ namespace swift {
 
   /// Describes the current behavior to take with a diagnostic.
   /// Ordered from most severe to least.
-  enum class DiagnosticBehavior : uint8_t {
-    Unspecified = 0,
-    Fatal,
-    Error,
-    Warning,
-    Remark,
-    Note,
-    Ignore,
+  struct DiagnosticBehavior {
+    enum Kind : uint8_t {
+      Unspecified = 0,
+      Fatal,
+      Error,
+      Warning,
+      Remark,
+      Note,
+      Ignore,
+    };
+
+    Kind kind;
+
+    DiagnosticBehavior() : kind(Unspecified) {}
+    DiagnosticBehavior(Kind kind) : kind(kind) {}
+    operator Kind() const { return kind; }
+
+    /// Move up the lattice returning the max value.
+    DiagnosticBehavior merge(DiagnosticBehavior other) const {
+      auto value = std::max(std::underlying_type<Kind>::type(*this),
+                            std::underlying_type<Kind>::type(other));
+      return Kind(value);
+    }
   };
 
   struct DiagnosticFormatOptions {

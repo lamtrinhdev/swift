@@ -487,6 +487,13 @@ void diagnoseDuplicateCaptureVars(CaptureListExpr *expr);
 Type checkReferenceOwnershipAttr(VarDecl *D, Type interfaceType,
                                  ReferenceOwnershipAttr *attr);
 
+/// Checks if the given witness can structurally match the requirement, ie.
+/// whether it has a matching kind like static vs. non-static, matching decl,
+/// etc. It does not check if the types of the witness is able to satisfy the
+/// requirement.
+/// If there is a matching failure, returns a `false`, otherwise return `true`.
+bool witnessStructureMatches(ValueDecl *req, const ValueDecl *witness);
+
 /// Infer default value witnesses for all requirements in the given protocol.
 void inferDefaultWitnesses(ProtocolDecl *proto);
 
@@ -983,10 +990,10 @@ bool diagnoseConformanceExportability(SourceLoc loc,
 /// is sufficient to safely conform to the requirement in the context
 /// the provided conformance. On return, requiredAvailability holds th
 /// availability levels required for conformance.
-bool
-isAvailabilitySafeForConformance(ProtocolDecl *proto, ValueDecl *requirement,
-                                 ValueDecl *witness, DeclContext *dc,
-                                 AvailabilityContext &requiredAvailability);
+bool isAvailabilitySafeForConformance(
+    const ProtocolDecl *proto, const ValueDecl *requirement,
+    const ValueDecl *witness, const DeclContext *dc,
+    AvailabilityContext &requiredAvailability);
 
 /// Returns an over-approximation of the range of operating system versions
 /// that could the passed-in location could be executing upon for
@@ -1426,7 +1433,7 @@ LabeledStmt *findBreakOrContinueStmtTarget(ASTContext &ctx,
 /// Check the correctness of a 'fallthrough' statement.
 ///
 /// \returns true if an error occurred.
-bool checkFallthroughStmt(DeclContext *dc, FallthroughStmt *stmt);
+bool checkFallthroughStmt(FallthroughStmt *stmt);
 
 /// Check for restrictions on the use of the @unknown attribute on a
 /// case statement.
@@ -1522,9 +1529,30 @@ public:
   }
 };
 
+using RequiredImportAccessLevelCallback =
+    std::function<void(AttributedImport<ImportedModule>)>;
+
+/// Make a note that uses of \p decl in \p dc require that the decl's defining
+/// module be imported with an access level that is at least as permissive as \p
+/// accessLevel.
+void recordRequiredImportAccessLevelForDecl(
+    const Decl *decl, const DeclContext *dc, AccessLevel accessLevel,
+    RequiredImportAccessLevelCallback remark);
+
 /// Report imports that are marked public but are not used in API.
 void diagnoseUnnecessaryPublicImports(SourceFile &SF);
 
+/// Emit or delay a diagnostic that suggests adding a missing import that is
+/// necessary to bring \p decl into scope in the containing source file. If
+/// delayed, the diagnostic will instead be emitted after type checking the
+/// entire file and will include an appropriate fix-it. Returns true if a
+/// diagnostic was emitted (and not delayed).
+bool maybeDiagnoseMissingImportForMember(const ValueDecl *decl,
+                                         const DeclContext *dc, SourceLoc loc);
+
+/// Emit delayed diagnostics regarding imports that should be added to the
+/// source file.
+void diagnoseMissingImports(SourceFile &sf);
 } // end namespace swift
 
 #endif

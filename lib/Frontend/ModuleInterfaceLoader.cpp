@@ -1403,7 +1403,7 @@ ModuleInterfaceCheckerImpl::getCompiledModuleCandidatesForInterface(
 
   auto validateModule = [&](StringRef modulePath) {
     // Legacy behavior do not validate module.
-    if (Ctx.SearchPathOpts.NoScannerModuleValidation)
+    if (!Ctx.SearchPathOpts.ScannerModuleValidation)
       return true;
 
     // If we picked the other module already, no need to validate this one since
@@ -1787,6 +1787,9 @@ void InterfaceSubContextDelegateImpl::inheritOptionsForBuildingInterface(
   genericSubInvocation.getClangImporterOptions().ClangImporterDirectCC1Scan =
       clangImporterOpts.ClangImporterDirectCC1Scan;
 
+  genericSubInvocation.getSearchPathOptions().ScannerPrefixMapper =
+      SearchPathOpts.ScannerPrefixMapper;
+
   // Validate Clang modules once per-build session flags must be consistent
   // across all module sub-invocations
   if (clangImporterOpts.ValidateModulesOnce) {
@@ -1922,8 +1925,7 @@ InterfaceSubContextDelegateImpl::InterfaceSubContextDelegateImpl(
       searchPathOpts.PluginSearchOpts;
 
   // Get module loading behavior options.
-  genericSubInvocation.getSearchPathOptions().NoScannerModuleValidation =
-      searchPathOpts.NoScannerModuleValidation;
+  genericSubInvocation.getSearchPathOptions().ScannerModuleValidation = searchPathOpts.ScannerModuleValidation;
   genericSubInvocation.getSearchPathOptions().ModuleLoadMode =
       searchPathOpts.ModuleLoadMode;
 
@@ -2136,15 +2138,18 @@ InterfaceSubContextDelegateImpl::runInSubContext(StringRef moduleName,
                                                  StringRef outputPath,
                                                  SourceLoc diagLoc,
     llvm::function_ref<std::error_code(ASTContext&, ModuleDecl*, ArrayRef<StringRef>,
-                            ArrayRef<StringRef>, StringRef)> action) {
+                          ArrayRef<StringRef>, StringRef, StringRef)> action) {
   return runInSubCompilerInstance(moduleName, interfacePath, sdkPath, outputPath,
                                   diagLoc, /*silenceErrors=*/false,
                                   [&](SubCompilerInstanceInfo &info){
+    std::string UserModuleVer = info.Instance->getInvocation().getFrontendOptions()
+      .UserModuleVersion.getAsString();
     return action(info.Instance->getASTContext(),
                   info.Instance->getMainModule(),
                   info.BuildArguments,
                   info.ExtraPCMArgs,
-                  info.Hash);
+                  info.Hash,
+                  UserModuleVer);
   });
 }
 

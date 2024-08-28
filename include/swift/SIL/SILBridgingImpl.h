@@ -364,8 +364,8 @@ bool BridgedType::isExactSuperclassOf(BridgedType t) const {
   return unbridged().isExactSuperclassOf(t.unbridged());
 }
 
-BridgedType BridgedType::getInstanceTypeOfMetatype(BridgedFunction f) const {
-  return unbridged().getInstanceTypeOfMetatype(f.getFunction());
+BridgedType BridgedType::getLoweredInstanceTypeOfMetatype(BridgedFunction f) const {
+  return unbridged().getLoweredInstanceTypeOfMetatype(f.getFunction());
 }
 
 bool BridgedType::isDynamicSelfMetatype() const {
@@ -693,10 +693,6 @@ bool BridgedFunction::isPossiblyUsedExternally() const {
   return getFunction()->isPossiblyUsedExternally();
 }
 
-bool BridgedFunction::isAvailableExternally() const {
-  return getFunction()->isAvailableExternally();
-}
-
 bool BridgedFunction::isTransparent() const {
   return getFunction()->isTransparent() == swift::IsTransparent;
 }
@@ -788,7 +784,11 @@ void BridgedFunction::setIsPerformanceConstraint(bool isPerfConstraint) const {
   getFunction()->setIsPerformanceConstraint(isPerfConstraint);
 }
 
-void BridgedFunction::setLinkage(Linkage linkage) const {
+BridgedLinkage BridgedFunction::getLinkage() const {
+  return (BridgedLinkage)getFunction()->getLinkage();
+}
+
+void BridgedFunction::setLinkage(BridgedLinkage linkage) const {
   getFunction()->setLinkage((swift::SILLinkage)linkage);
 }
 
@@ -825,12 +825,12 @@ bool BridgedGlobalVar::isLet() const { return getGlobal()->isLet(); }
 
 void BridgedGlobalVar::setLet(bool value) const { getGlobal()->setLet(value); }
 
-bool BridgedGlobalVar::isPossiblyUsedExternally() const {
-  return getGlobal()->isPossiblyUsedExternally();
+BridgedLinkage BridgedGlobalVar::getLinkage() const {
+  return (BridgedLinkage)getGlobal()->getLinkage();
 }
 
-bool BridgedGlobalVar::isAvailableExternally() const {
-  return swift::isAvailableExternally(getGlobal()->getLinkage());
+bool BridgedGlobalVar::isPossiblyUsedExternally() const {
+  return getGlobal()->isPossiblyUsedExternally();
 }
 
 OptionalBridgedInstruction BridgedGlobalVar::getFirstStaticInitInst() const {
@@ -1083,12 +1083,20 @@ bool BridgedInstruction::BeginBorrow_isLexical() const {
   return getAs<swift::BeginBorrowInst>()->isLexical();
 }
 
+bool BridgedInstruction::BeginBorrow_hasPointerEscape() const {
+  return getAs<swift::BeginBorrowInst>()->hasPointerEscape();
+}
+
 bool BridgedInstruction::BeginBorrow_isFromVarDecl() const {
   return getAs<swift::BeginBorrowInst>()->isFromVarDecl();
 }
 
 bool BridgedInstruction::MoveValue_isLexical() const {
   return getAs<swift::MoveValueInst>()->isLexical();
+}
+
+bool BridgedInstruction::MoveValue_hasPointerEscape() const {
+  return getAs<swift::MoveValueInst>()->hasPointerEscape();
 }
 
 bool BridgedInstruction::MoveValue_isFromVarDecl() const {
@@ -1101,6 +1109,10 @@ SwiftInt BridgedInstruction::ProjectBoxInst_fieldIndex() const {
 
 bool BridgedInstruction::EndCOWMutationInst_doKeepUnique() const {
   return getAs<swift::EndCOWMutationInst>()->doKeepUnique();
+}
+
+bool BridgedInstruction::DestroyValueInst_isDeadEnd() const {
+  return getAs<swift::DestroyValueInst>()->isDeadEnd();
 }
 
 SwiftInt BridgedInstruction::EnumInst_caseIndex() const {
@@ -1137,6 +1149,10 @@ bool BridgedInstruction::RefElementAddrInst_isImmutable() const {
 
 void BridgedInstruction::RefElementAddrInst_setImmutable(bool isImmutable) const {
   getAs<swift::RefElementAddrInst>()->setImmutable(isImmutable);
+}
+
+bool BridgedInstruction::RefTailAddrInst_isImmutable() const {
+  return getAs<swift::RefTailAddrInst>()->isImmutable();
 }
 
 SwiftInt BridgedInstruction::PartialApplyInst_numArguments() const {
@@ -1246,6 +1262,10 @@ SwiftInt BridgedInstruction::BeginAccessInst_getAccessKind() const {
 
 bool BridgedInstruction::BeginAccessInst_isStatic() const {
   return getAs<swift::BeginAccessInst>()->getEnforcement() == swift::SILAccessEnforcement::Static;
+}
+
+bool BridgedInstruction::BeginAccessInst_isUnsafe() const {
+  return getAs<swift::BeginAccessInst>()->getEnforcement() == swift::SILAccessEnforcement::Unsafe;
 }
 
 bool BridgedInstruction::CopyAddrInst_isTakeOfSrc() const {
@@ -1595,7 +1615,7 @@ BridgedInstruction BridgedBuilder::createAllocStack(BridgedType type,
       regularLoc(), type.unbridged(), std::nullopt,
       swift::HasDynamicLifetime_t(hasDynamicLifetime),
       swift::IsLexical_t(isLexical), swift::IsFromVarDecl_t(isFromVarDecl),
-      swift::UsesMoveableValueDebugInfo_t(wasMoved))};
+      swift::UsesMoveableValueDebugInfo_t(wasMoved), /*skipVarDeclAssert=*/ true)};
 }
 
 BridgedInstruction BridgedBuilder::createAllocVector(BridgedValue capacity, BridgedType type) const {

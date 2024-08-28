@@ -358,6 +358,11 @@ inferIsolationInfoForTempAllocStack(AllocStackInst *asi) {
 
 SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
   if (auto fas = FullApplySite::isa(inst)) {
+    // Check if we have SIL based "faked" isolation crossings that we use for
+    // testing purposes.
+    //
+    // NOTE: Please do not use getWithIsolationCrossing in more places! We only
+    // want to use it here!
     if (auto crossing = fas.getIsolationCrossing()) {
       if (auto info = SILIsolationInfo::getWithIsolationCrossing(*crossing))
         return info;
@@ -754,19 +759,6 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
     }
   }
 
-  // Try to infer using SIL first since we might be able to get the source name
-  // of the actor.
-  if (ApplyExpr *apply = inst->getLoc().getAsASTNode<ApplyExpr>()) {
-    if (auto crossing = apply->getIsolationCrossing()) {
-      if (auto info = SILIsolationInfo::getWithIsolationCrossing(*crossing))
-        return info;
-
-      if (crossing->getCalleeIsolation().isNonisolated()) {
-        return SILIsolationInfo::getDisconnected(false /*nonisolated(unsafe)*/);
-      }
-    }
-  }
-
   if (auto *asi = dyn_cast<AllocStackInst>(inst)) {
     if (asi->isFromVarDecl()) {
       if (auto *varDecl = asi->getLoc().getAsASTNode<VarDecl>()) {
@@ -801,6 +793,23 @@ SILIsolationInfo SILIsolationInfo::get(SILInstruction *inst) {
     }
   }
 
+  // Check if we have an ApplyInst with nonisolated.
+  //
+  // NOTE: We purposely avoid using other isolation info from an ApplyExpr since
+  // when we use the isolation crossing on the ApplyExpr at this point,w e are
+  // unable to find out what the appropriate instance is (since we would have
+  // found it earlier if we could). This ensures that we can eliminate a case
+  // where we get a SILIsolationInfo with actor isolation and without a SILValue
+  // actor instance. This prevents a class of bad SILIsolationInfo merge errors
+  // caused by the actor instances not matching.
+  if (ApplyExpr *apply = inst->getLoc().getAsASTNode<ApplyExpr>()) {
+    if (auto crossing = apply->getIsolationCrossing()) {
+      if (crossing->getCalleeIsolation().isNonisolated()) {
+        return SILIsolationInfo::getDisconnected(false /*nonisolated(unsafe)*/);
+      }
+    }
+  }
+
   return SILIsolationInfo();
 }
 
@@ -823,11 +832,19 @@ SILIsolationInfo SILIsolationInfo::get(SILArgument *arg) {
 
   auto *fArg = cast<SILFunctionArgument>(arg);
 
-  // Transferring is always disconnected.
+  // Sending is always disconnected.
+  if (fArg->isSending())
+    return SILIsolationInfo::getDisconnected(false /*nonisolated(unsafe)*/);
+
+  // If we have a closure capture that is not an indirect result or indirect
+  // result error, we want to treat it as sending so that we properly handle
+  // async lets.
+  //
+  // This pattern should only come up with async lets. See comment in
+  // isTransferrableFunctionArgument.
   if (!fArg->isIndirectResult() && !fArg->isIndirectErrorResult() &&
-      ((fArg->isClosureCapture() &&
-        fArg->getFunction()->getLoweredFunctionType()->isSendable()) ||
-       fArg->isSending()))
+      fArg->isClosureCapture() &&
+      fArg->getFunction()->getLoweredFunctionType()->isSendable())
     return SILIsolationInfo::getDisconnected(false /*nonisolated(unsafe)*/);
 
   // Before we do anything further, see if we have an isolated parameter. This
@@ -1164,8 +1181,26 @@ bool SILIsolationInfo::isNonSendableType(SILType type, SILFunction *fn) {
     return false;
   }
 
-  // Otherwise, delegate to seeing if type conforms to the Sendable protocol.
-  return !type.isSendable(fn);
+  // First before we do anything, see if we have a Sendable type. In such a
+  // case, just return true early.
+  //
+  // DISCUSSION: It is important that we do this first since otherwise calling
+  // getConcurrencyDiagnosticBehavior could cause us to prevent a
+  // "preconcurrency" unneeded diagnostic when just using Sendable values. We
+  // only want to trigger that if we analyze a non-Sendable type.
+  if (type.isSendable(fn))
+    return false;
+
+  // Grab out behavior. If it is none, then we have a type that we want to treat
+  // as non-Sendable.
+  auto behavior = type.getConcurrencyDiagnosticBehavior(fn);
+  if (!behavior)
+    return true;
+
+  // Finally, if we are not supposed to ignore, then we have a true non-Sendable
+  // type. Types whose diagnostics we are supposed to ignore, we want to treat
+  // as Sendable.
+  return *behavior != DiagnosticBehavior::Ignore;
 }
 
 //===----------------------------------------------------------------------===//

@@ -29,6 +29,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/CanTypeVisitor.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsCommon.h"
 #include "swift/AST/DistributedDecl.h"
@@ -2143,8 +2144,7 @@ RValue RValueEmitter::visitErasureExpr(ErasureExpr *E, SGFContext C) {
   auto &existentialTL = SGF.getTypeLowering(E->getType());
   auto concreteFormalType = E->getSubExpr()->getType()->getCanonicalType();
 
-  auto archetype = OpenedArchetypeType::getAny(E->getType()->getCanonicalType(),
-                                               SGF.F.getGenericSignature());
+  auto archetype = OpenedArchetypeType::getAny(E->getType()->getCanonicalType());
   AbstractionPattern abstractionPattern(archetype);
   auto &concreteTL = SGF.getTypeLowering(abstractionPattern,
                                          concreteFormalType);
@@ -3185,8 +3185,7 @@ emitKeyPathRValueBase(SILGenFunction &subSGF,
     // new one (which we'll upcast immediately below) for a class member.
     ArchetypeType *opened;
     if (storage->getDeclContext()->getSelfClassDecl()) {
-      opened = OpenedArchetypeType::get(baseType,
-                                        subSGF.F.getGenericSignature());
+      opened = OpenedArchetypeType::get(baseType);
     } else {
       opened = subs.getReplacementTypes()[0]->castTo<ArchetypeType>();
     }
@@ -4216,11 +4215,12 @@ SILGenModule::emitKeyPathComponentForDecl(SILLocation loc,
     // Map the substitutions out of context.
     if (!subs.empty()) {
       externalSubs = subs;
-      // If any of the substitutions involve local archetypes, then the
+      // If any of the substitutions involve primary archetypes, then the
       // key path pattern needs to capture the generic context, and we need
       // to map the pattern substitutions out of this context.
-      if (externalSubs.hasArchetypes()) {
+      if (externalSubs.getRecursiveProperties().hasArchetype()) {
         needsGenericContext = true;
+        // FIXME: This doesn't do anything for local archetypes!
         externalSubs = externalSubs.mapReplacementTypesOutOfContext();
       }
     }
@@ -6145,12 +6145,12 @@ static void diagnoseImplicitRawConversion(Type sourceTy, Type pointerTy,
   auto &ctx = SGF.getASTContext();
   if (auto *bitwiseCopyableDecl = ctx.getProtocol(
         KnownProtocolKind::BitwiseCopyable)) {
-    if (ModuleDecl::checkConformance(eltTy, bitwiseCopyableDecl))
+    if (checkConformance(eltTy, bitwiseCopyableDecl))
       return;
   }
   if (auto *fixedWidthIntegerDecl = ctx.getProtocol(
           KnownProtocolKind::FixedWidthInteger)) {
-    if (ModuleDecl::checkConformance(eltTy, fixedWidthIntegerDecl))
+    if (checkConformance(eltTy, fixedWidthIntegerDecl))
       return;
   }
 

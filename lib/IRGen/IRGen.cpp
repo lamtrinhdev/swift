@@ -211,6 +211,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
   bool RunSwiftSpecificLLVMOptzns =
       !Opts.DisableSwiftSpecificLLVMOptzns && !Opts.DisableLLVMOptzns;
 
+  bool DoHotColdSplit = false;
   PTO.CallGraphProfile = false;
 
   llvm::OptimizationLevel level = llvm::OptimizationLevel::O0;
@@ -221,6 +222,8 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
     PTO.LoopVectorization = true;
     PTO.SLPVectorization = true;
     PTO.MergeFunctions = true;
+    // Splitting trades code size to enhance memory locality, avoid in -Osize.
+    DoHotColdSplit = Opts.EnableHotColdSplit && !Opts.optimizeForSize();
     level = llvm::OptimizationLevel::Os;
   } else {
     level = llvm::OptimizationLevel::O0;
@@ -258,6 +261,8 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
   ModulePassManager MPM;
+
+  PB.setEnableHotColdSplitting(DoHotColdSplit);
 
   if (RunSwiftSpecificLLVMOptzns) {
     PB.registerScalarOptimizerLateEPCallback(

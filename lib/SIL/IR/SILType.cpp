@@ -25,6 +25,7 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/Test.h"
 #include "swift/SIL/TypeLowering.h"
+#include "swift/Sema/Concurrency.h"
 #include <tuple>
 
 using namespace swift;
@@ -477,56 +478,6 @@ bool SILType::isHeapObjectReferenceType() const {
   return false;
 }
 
-bool SILType::aggregateContainsRecord(SILType Record, SILModule &Mod,
-                                      TypeExpansionContext context) const {
-  assert(!hasArchetype() && "Agg should be proven to not be generic "
-                             "before passed to this function.");
-  assert(!Record.hasArchetype() && "Record should be proven to not be generic "
-                                    "before passed to this function.");
-
-  llvm::SmallVector<SILType, 8> Worklist;
-  Worklist.push_back(*this);
-
-  // For each "subrecord" of agg in the worklist...
-  while (!Worklist.empty()) {
-    SILType Ty = Worklist.pop_back_val();
-
-    // If it is record, we succeeded. Return true.
-    if (Ty == Record)
-      return true;
-
-    // Otherwise, we gather up sub-records that need to be checked for
-    // checking... First handle the tuple case.
-    if (CanTupleType TT = Ty.getAs<TupleType>()) {
-      for (unsigned i = 0, e = TT->getNumElements(); i != e; ++i)
-        Worklist.push_back(Ty.getTupleElementType(i));
-      continue;
-    }
-
-    // Then if we have an enum...
-    if (EnumDecl *E = Ty.getEnumOrBoundGenericEnum()) {
-      for (auto Elt : E->getAllElements())
-        if (Elt->hasAssociatedValues())
-          Worklist.push_back(Ty.getEnumElementType(Elt, Mod, context));
-      continue;
-    }
-
-    // Then if we have a struct address...
-    if (StructDecl *S = Ty.getStructOrBoundGenericStruct())
-      for (VarDecl *Var : S->getStoredProperties())
-        Worklist.push_back(Ty.getFieldType(Var, Mod, context));
-
-    // If we have a class address, it is a pointer so it cannot contain other
-    // types.
-
-    // If we reached this point, then this type has no subrecords. Since it does
-    // not equal our record, we can skip it.
-  }
-
-  // Could not find the record in the aggregate.
-  return false;
-}
-
 bool SILType::aggregateHasUnreferenceableStorage() const {
   if (auto s = getStructOrBoundGenericStruct()) {
     return s->hasUnreferenceableStorage();
@@ -905,7 +856,7 @@ bool SILType::isDifferentiable(SILModule &M) const {
 
 Type
 TypeBase::replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) const {
-  return Type(const_cast<TypeBase *>(this)).transform([&](Type t) -> Type {
+  return Type(const_cast<TypeBase *>(this)).transformRec([&](TypeBase *t) -> std::optional<Type> {
     if (auto *f = t->getAs<SILFunctionType>()) {
       auto sft = f->getUnsubstitutedType(M);
       
@@ -957,7 +908,7 @@ TypeBase::replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) cons
                                   SubstitutionMap(),
                                   M.getASTContext());
     }
-    return t;
+    return std::nullopt;
   });
 }
 
@@ -1142,7 +1093,7 @@ bool SILType::isValueTypeWithDeinit() const {
   return false;
 }
 
-SILType SILType::getInstanceTypeOfMetatype(SILFunction *function) const {
+SILType SILType::getLoweredInstanceTypeOfMetatype(SILFunction *function) const {
   auto metaType = castTo<MetatypeType>();
   CanType instanceTy = metaType.getInstanceType();
   auto &tl = function->getModule().Types.getTypeLowering(instanceTy, TypeExpansionContext(*function));
@@ -1303,6 +1254,15 @@ SILType SILType::removingAnyMoveOnlyWrapping(const SILFunction *fn) {
 
 bool SILType::isSendable(SILFunction *fn) const {
   return getASTType()->isSendableType();
+}
+
+std::optional<DiagnosticBehavior>
+SILType::getConcurrencyDiagnosticBehavior(SILFunction *fn) const {
+  auto declRef = fn->getDeclRef();
+  if (!declRef)
+    return {};
+  auto *fromDC = declRef.getInnermostDeclContext();
+  return getASTType()->getConcurrencyDiagnosticBehaviorLimit(fromDC);
 }
 
 namespace swift::test {

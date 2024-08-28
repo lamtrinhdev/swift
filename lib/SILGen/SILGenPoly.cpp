@@ -96,6 +96,7 @@
 #include "swift/Basic/Assertions.h"
 #include "swift/Basic/Generators.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -253,8 +254,8 @@ SILGenFunction::emitTransformExistential(SILLocation loc,
   FormalEvaluationScope scope(*this);
 
   if (inputType->isAnyExistentialType()) {
-    CanType openedType = OpenedArchetypeType::getAny(inputType,
-                                                     F.getGenericSignature());
+    CanType openedType = OpenedArchetypeType::getAny(inputType)
+        ->getCanonicalType();
     SILType loweredOpenedType = getLoweredType(openedType);
 
     input = emitOpenExistential(loc, input,
@@ -277,8 +278,7 @@ SILGenFunction::emitTransformExistential(SILLocation loc,
 
   assert(!fromInstanceType.isAnyExistentialType());
   ArrayRef<ProtocolConformanceRef> conformances =
-      SGM.M.getSwiftModule()->collectExistentialConformances(
-                                     fromInstanceType,
+      collectExistentialConformances(fromInstanceType,
                                      toInstanceType,
                                      /*allowMissing=*/true);
 
@@ -642,9 +642,8 @@ ManagedValue Transform::transform(ManagedValue v,
 
     auto layout = instanceType.getExistentialLayout();
     if (layout.getSuperclass()) {
-      CanType openedType =
-          OpenedArchetypeType::getAny(inputSubstType,
-                                      SGF.F.getGenericSignature());
+      CanType openedType = OpenedArchetypeType::getAny(inputSubstType)
+          ->getCanonicalType();
       SILType loweredOpenedType = SGF.getLoweredType(openedType);
 
       FormalEvaluationScope scope(SGF);
@@ -667,8 +666,7 @@ ManagedValue Transform::transform(ManagedValue v,
   if (outputSubstType->isAnyHashable()) {
     auto *protocol = SGF.getASTContext().getProtocol(
         KnownProtocolKind::Hashable);
-    auto conformance = ModuleDecl::lookupConformance(
-        inputSubstType, protocol);
+    auto conformance = lookupConformance(inputSubstType, protocol);
     auto addr = v.getType().isAddress() ? v : v.materialize(SGF, Loc);
     auto result = SGF.emitAnyHashableErasure(Loc, addr, inputSubstType,
                                              conformance, ctxt);
@@ -1803,7 +1801,7 @@ private:
     auto opaque = AbstractionPattern::getOpaque();
     auto &concreteTL = SGF.getTypeLowering(opaque, outerSubstType);
 
-    auto conformances = SGF.SGM.M.getSwiftModule()->collectExistentialConformances(
+    auto conformances = collectExistentialConformances(
         outerSubstType, innerSubstType);
 
     auto innerTupleAddr =
@@ -4369,7 +4367,7 @@ ResultPlanner::expandInnerTupleOuterIndirect(AbstractionPattern innerOrigType,
       return;
     }
 
-    auto conformances = SGF.SGM.M.getSwiftModule()->collectExistentialConformances(
+    auto conformances = collectExistentialConformances(
         innerSubstType, outerSubstType);
 
     // Prepare the value slot in the existential.
@@ -4541,13 +4539,11 @@ void ResultPlanner::planExpandedIntoDirect(AbstractionPattern innerOrigType,
              "optional nor are we under opaque value mode");
       assert(outerSubstType->isAny());
 
-      auto *module = SGF.getModule().getSwiftModule();
-
       auto opaque = AbstractionPattern::getOpaque();
       auto anyType = SGF.getLoweredType(opaque, outerSubstType);
       auto outerResultAddr = SGF.emitTemporaryAllocation(Loc, anyType);
       auto conformances =
-        module->collectExistentialConformances(innerSubstType, outerSubstType);
+        collectExistentialConformances(innerSubstType, outerSubstType);
 
       SILValue outerConcreteResultAddr = SGF.B.createInitExistentialAddr(
           Loc, outerResultAddr, innerSubstType,

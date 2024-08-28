@@ -96,9 +96,12 @@ do {
   }  
   inSubcall = false
 
-  // This is a problem, but isn't clear what was intended.
-  var somethingElse = true { // expected-error {{unexpected '{' in declaration}}
-  }  
+  // These are a problems, but it's not clear what was intended.
+  var somethingElse = true {
+  // expected-error@-1 {{computed property must have an explicit type}}
+  // expected-error@-2 {{variable with getter/setter cannot have an initial value}}
+  }
+  var somethingElseWithTypeAnno: Bool = true {} // expected-error {{variable with getter/setter cannot have an initial value}}
   inSubcall = false
 
   var v2 : Bool = false
@@ -386,7 +389,7 @@ func rdar21078316() {
 
 // <rdar://problem/20978044> QoI: Poor diagnostic when using an incorrect tuple element in a closure
 var numbers = [1, 2, 3]
-zip(numbers, numbers).filter { $0.2 > 1 }  // expected-error {{value of tuple type '(Int, Int)' has no member '2'}}
+zip(numbers, numbers).filter { $0.2 > 1 }  // expected-error {{value of tuple type 'Zip2Sequence<[Int], [Int]>.Element' (aka '(Int, Int)') has no member '2'}}
 
 
 

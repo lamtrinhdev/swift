@@ -19,6 +19,7 @@
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckEffects.h"
 #include "swift/AST/ASTPrinter.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -1589,10 +1590,9 @@ shouldOpenExistentialCallArgument(ValueDecl *callee, unsigned paramIdx,
       existentialObjectType = existentialMetaTy->getInstanceType();
     else
       existentialObjectType = argTy;
-    auto module = cs.DC->getParentModule();
     bool containsNonSelfConformance = false;
     for (auto proto : genericSig->getRequiredProtocols(genericParam)) {
-      auto conformance = module->lookupExistentialConformance(
+      auto conformance = lookupExistentialConformance(
           existentialObjectType, proto);
       if (conformance.isInvalid()) {
         containsNonSelfConformance = true;
@@ -3784,9 +3784,7 @@ ConstraintSystem::matchDeepEqualityTypes(Type type1, Type type2,
 
     // It's possible to declare a generic requirement like Self == Self.Iterator
     // where both types are going to be opaque.
-    if (!opaque1->getCanonicalInterfaceType(arch1->getInterfaceType())
-             ->isEqual(
-                 opaque2->getCanonicalInterfaceType(arch2->getInterfaceType())))
+    if (!opaque1->getInterfaceType()->isEqual(opaque2->getInterfaceType()))
       return getTypeMatchFailure(locator);
 
     auto args1 = opaque1->getSubstitutions().getReplacementTypes();
@@ -3929,8 +3927,8 @@ ConstraintSystem::matchDeepEqualityTypes(Type type1, Type type2,
 
   if (shouldAttemptFixes()) {
     auto *baseLoc =
-      getConstraintLocator(locator, {LocatorPathElt::GenericType(bound1),
-          LocatorPathElt::GenericType(bound2)});
+      getConstraintLocator(locator, {LocatorPathElt::GenericType(type1),
+          LocatorPathElt::GenericType(type2)});
 
     auto argMatchingFlags = subflags;
     // Allow the solver to produce separate fixes while matching
@@ -6203,6 +6201,24 @@ bool ConstraintSystem::repairFailures(
       conversionsOrFixes.push_back(fix);
     }
     break;
+  }
+
+  case ConstraintLocator::ExistentialConstraintType: {
+    if (lhs->hasPlaceholder() || rhs->hasPlaceholder())
+      return true;
+
+    // If there are any restrictions/conversions left to attempt, wait.
+    if (hasAnyRestriction())
+      break;
+
+    // Drop the element introduced by DeepEquality matcher.
+    path.pop_back();
+
+    // Presence of DeepEquality conversion delayed repair but since the
+    // constraint types didn't match easier, let's retry it.
+    return repairFailures(ExistentialType::get(lhs), ExistentialType::get(rhs),
+                          matchKind, flags, conversionsOrFixes,
+                          getConstraintLocator(anchor, path));
   }
 
   case ConstraintLocator::ClosureBody:
@@ -10290,8 +10306,7 @@ performMemberLookup(ConstraintKind constraintKind, DeclNameRef memberName,
 
     if (shouldCheckSendabilityOfBase()) {
       auto sendableProtocol = Context.getProtocol(KnownProtocolKind::Sendable);
-      auto baseConformance = ModuleDecl::lookupConformance(
-          instanceTy, sendableProtocol);
+      auto baseConformance = lookupConformance(instanceTy, sendableProtocol);
 
       if (llvm::any_of(
               baseConformance.getConditionalRequirements(),
@@ -11094,13 +11109,11 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyMemberConstraint(
                                 ConstraintLocator *locator) -> SolutionKind {
       // Let's check whether there are any generic parameters associated with
       // base type, and record potential holes if so.
-      simplifyType(baseTy).transform([&](Type type) -> Type {
+      simplifyType(baseTy).visit([&](Type type) {
         if (auto *typeVar = type->getAs<TypeVariableType>()) {
-          if (typeVar->getImpl().hasRepresentativeOrFixed())
-            return type;
-          recordPotentialHole(typeVar);
+          if (!typeVar->getImpl().hasRepresentativeOrFixed())
+            recordPotentialHole(typeVar);
         }
-        return type;
       });
 
       auto success = [&]() -> SolutionKind {
@@ -11424,8 +11437,7 @@ ConstraintSystem::simplifyValueWitnessConstraint(
   // conformance.
   if (baseObjectType->isExistentialType()) {
     baseObjectType =
-        OpenedArchetypeType::get(baseObjectType->getCanonicalType(),
-                                 useDC->getGenericSignatureOfContext());
+        OpenedArchetypeType::get(baseObjectType->getCanonicalType());
   }
 
   // Check conformance to the protocol. If it doesn't conform, this constraint
@@ -11835,10 +11847,19 @@ bool ConstraintSystem::resolveClosure(TypeVariableType *typeVar,
         if (contextualParam->isIsolated() && !flags.isIsolated() && paramDecl)
           isolatedParams.insert(paramDecl);
 
+        // Carry-over the ownership specifier from the contextual parameter.
+        auto paramOwnership =
+            contextualParam->getParameterFlags().getOwnershipSpecifier();
+
+        // `sending` is already carried over; skip this related ownership kind.
+        if (paramOwnership == ParamSpecifier::ImplicitlyCopyableConsuming)
+          paramOwnership = flags.getOwnershipSpecifier();
+
         param = param.withFlags(flags.withInOut(contextualParam->isInOut())
                                     .withVariadic(contextualParam->isVariadic())
                                     .withIsolated(contextualParam->isIsolated())
-                                    .withSending(contextualParam->isSending()));
+                                    .withSending(contextualParam->isSending())
+                                    .withOwnershipSpecifier(paramOwnership));
       }
     }
 
@@ -13950,6 +13971,8 @@ ConstraintSystem::simplifyExplicitGenericArgumentsConstraint(
 
   // Bail out if we haven't selected an overload yet.
   auto simplifiedBoundType = simplifyType(type1, flags);
+  if (simplifiedBoundType->isPlaceholder())
+    return SolutionKind::Solved;
   if (simplifiedBoundType->isTypeVariableOrMember())
     return formUnsolved();
 
@@ -13978,6 +14001,8 @@ ConstraintSystem::simplifyExplicitGenericArgumentsConstraint(
     decl = bound->getDecl();
     for (auto argType : bound->getDirectGenericArgs()) {
       auto *typeVar = argType->getAs<TypeVariableType>();
+      if (!typeVar)
+        return SolutionKind::Error;
       auto *genericParam = typeVar->getImpl().getGenericParameter();
       openedTypes.push_back({genericParam, typeVar});
     }
@@ -14042,13 +14067,15 @@ ConstraintSystem::simplifyExplicitGenericArgumentsConstraint(
     }
   }
 
-  if (!decl->getAsGenericContext())
-    return SolutionKind::Error;
-
   auto genericParams = getGenericParams(decl);
-  if (!genericParams) {
-    // FIXME: Record an error here that we're ignoring the parameters.
-    return SolutionKind::Solved;
+  if (!decl->getAsGenericContext() || !genericParams) {
+    // Allow concrete macros to have specializations with just a warning.
+    return recordFix(AllowConcreteTypeSpecialization::create(
+               *this, type1, decl, getConstraintLocator(locator),
+               isa<MacroDecl>(decl) ? FixBehavior::DowngradeToWarning
+                                    : FixBehavior::Error))
+               ? SolutionKind::Error
+               : SolutionKind::Solved;
   }
 
   // Map the generic parameters we have over to their opened types.
@@ -14081,12 +14108,14 @@ ConstraintSystem::simplifyExplicitGenericArgumentsConstraint(
     }
   }
 
-  if (openedGenericParams.empty()) {
+  // FIXME: We could support explicit function specialization.
+  if (openedGenericParams.empty() ||
+      (isa<AbstractFunctionDecl>(decl) && !hasParameterPack)) {
     if (!shouldAttemptFixes())
       return SolutionKind::Error;
 
-    return recordFix(AllowConcreteTypeSpecialization::create(
-               *this, type1, getConstraintLocator(locator)))
+    return recordFix(AllowGenericFunctionSpecialization::create(
+               *this, decl, getConstraintLocator(locator)))
                ? SolutionKind::Error
                : SolutionKind::Solved;
   }
@@ -15217,6 +15246,7 @@ ConstraintSystem::SolutionKind ConstraintSystem::simplifyFixConstraint(
   case FixKind::AllowAssociatedValueMismatch:
   case FixKind::GenericArgumentsMismatch:
   case FixKind::AllowConcreteTypeSpecialization:
+  case FixKind::AllowGenericFunctionSpecialization:
   case FixKind::IgnoreGenericSpecializationArityMismatch:
   case FixKind::IgnoreKeyPathSubscriptIndexMismatch:
   case FixKind::AllowMemberRefOnExistential: {

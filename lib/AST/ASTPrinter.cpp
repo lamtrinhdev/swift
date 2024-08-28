@@ -23,6 +23,7 @@
 #include "swift/AST/Builtins.h"
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/Comment.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/FileUnit.h"
@@ -743,7 +744,7 @@ class PrintAST : public ASTVisitor<PrintAST> {
 
   void printSwiftDocumentationComment(const Decl *D) {
     if (Options.CascadeDocComment)
-      D = getDocCommentProvidingDecl(D);
+      D = D->getDocCommentProvidingDecl();
     if (!D)
       return;
     auto RC = D->getRawComment();
@@ -1799,7 +1800,7 @@ void PrintAST::printSingleDepthOfGenericSignature(
         return type;
       },
       [&](CanType depType, Type substType, ProtocolDecl *proto) {
-        return ModuleDecl::lookupConformance(substType, proto);
+        return lookupConformance(substType, proto);
       });
   };
 
@@ -2022,6 +2023,9 @@ void PrintAST::printRequirement(const Requirement &req) {
   SmallVector<Type, 2> rootParameterPacks;
   getTransformedType(req.getFirstType())
       ->getTypeParameterPacks(rootParameterPacks);
+  if (req.getKind() != RequirementKind::Layout)
+    getTransformedType(req.getSecondType())
+        ->getTypeParameterPacks(rootParameterPacks);
   bool isPackRequirement = !rootParameterPacks.empty();
 
   switch (req.getKind()) {
@@ -3048,6 +3052,15 @@ suppressingFeatureBitwiseCopyable2(PrintOptions &options,
                                    llvm::function_ref<void()> action) {
   unsigned originalExcludeAttrCount = options.ExcludeAttrList.size();
   llvm::SaveAndRestore<bool> scope(options.SuppressBitwiseCopyable, true);
+  action();
+  options.ExcludeAttrList.resize(originalExcludeAttrCount);
+}
+
+static void
+suppressingFeatureAllowUnsafeAttribute(PrintOptions &options,
+                                       llvm::function_ref<void()> action) {
+  unsigned originalExcludeAttrCount = options.ExcludeAttrList.size();
+  options.ExcludeAttrList.push_back(DeclAttrKind::Unsafe);
   action();
   options.ExcludeAttrList.resize(originalExcludeAttrCount);
 }
@@ -4280,13 +4293,15 @@ void PrintAST::visitConstructorDecl(ConstructorDecl *decl) {
     // Protocol extension initializers are modeled as convenience initializers,
     // but they're not written that way in source. Check if we're actually
     // printing onto a class.
-    ClassDecl *classDecl = CurrentType
-                               ? CurrentType->getClassOrBoundGenericClass()
-                               : decl->getDeclContext()->getSelfClassDecl();
-    if (classDecl) {
-      // Convenience intializers are also unmarked on actors.
-      if (!classDecl->isActor())
-        Printer.printKeyword("convenience", Options, " ");
+    bool isClassContext;
+    if (CurrentType) {
+      isClassContext = CurrentType->getClassOrBoundGenericClass() != nullptr;
+    } else {
+      const DeclContext *dc = decl->getDeclContext();
+      isClassContext = dc->getSelfClassDecl() != nullptr;
+    }
+    if (isClassContext) {
+      Printer.printKeyword("convenience", Options, " ");
     } else {
       assert(decl->getDeclContext()->getExtendedProtocolDecl() &&
              "unexpected convenience initializer");
@@ -5870,8 +5885,8 @@ public:
         Printer << "error_expr";
       } else if (auto *DMT = originator.dyn_cast<DependentMemberType *>()) {
         visit(DMT);
-      } else if (originator.is<PlaceholderTypeRepr *>()) {
-        Printer << "placeholder_type_repr";
+      } else if (originator.is<TypeRepr *>()) {
+        Printer << "type_repr";
       } else {
         assert(false && "unknown originator");
       }
@@ -6128,11 +6143,11 @@ public:
       // FIXME: We need to replace nested existential metatypes so that
       // we don't print duplicate 'any'. This will be unnecessary once
       // ExistentialMetatypeType is split into ExistentialType(MetatypeType).
-      printWithParensIfNotSimple(instanceType.transform([](Type type) -> Type {
-        if (auto existential = type->getAs<ExistentialMetatypeType>())
+      printWithParensIfNotSimple(instanceType.transformRec([](Type t) -> std::optional<Type> {
+        if (auto existential = t->getAs<ExistentialMetatypeType>())
           return MetatypeType::get(existential->getInstanceType());
 
-        return type;
+        return std::nullopt;
       }));
     } else {
       assert(T->is<MetatypeType>());
@@ -6940,7 +6955,7 @@ public:
     // the generic signature of the contextual substitution map in the
     // opened element environment.
     auto env = T->getGenericEnvironment();
-    auto subs = env->getPackElementContextSubstitutions();
+    auto subs = env->getOuterSubstitutions();
     auto sig = subs.getGenericSignature();
     auto params = sig.getGenericParams();
 
@@ -7006,16 +7021,17 @@ public:
     Printer << "each ";
   }
 
-  void printArchetypeCommon(Type interfaceTy, ArchetypeType *archetypeTy) {
+  void printArchetypeCommon(Type interfaceTy, GenericEnvironment *env) {
     if (auto *paramTy = interfaceTy->getAs<GenericTypeParamType>()) {
-      assert(archetypeTy->isRoot());
-
       if (Options.AlternativeTypeNames) {
-        auto found = Options.AlternativeTypeNames->find(CanType(archetypeTy));
-        if (found != Options.AlternativeTypeNames->end()) {
-          if (paramTy->isParameterPack()) printEach();
-          Printer << found->second.str();
-          return;
+        auto archetypeTy = env->mapTypeIntoContext(paramTy)->getAs<GenericTypeParamType>();
+        if (archetypeTy) {
+          auto found = Options.AlternativeTypeNames->find(CanType(archetypeTy));
+          if (found != Options.AlternativeTypeNames->end()) {
+            if (paramTy->isParameterPack()) printEach();
+            Printer << found->second.str();
+            return;
+          }
         }
       }
 
@@ -7024,10 +7040,10 @@ public:
     }
 
     auto *memberTy = interfaceTy->castTo<DependentMemberType>();
-    if (memberTy->getBase()->is<GenericTypeParamType>())
-      visitParentType(archetypeTy->getRoot());
+    if (auto *paramTy = memberTy->getBase()->getAs<GenericTypeParamType>())
+      visitParentType(env->mapTypeIntoContext(paramTy));
     else {
-      printArchetypeCommon(memberTy->getBase(), archetypeTy->getRoot());
+      printArchetypeCommon(memberTy->getBase(), env);
       Printer << ".";
     }
 
@@ -7035,7 +7051,7 @@ public:
   }
 
   void visitPrimaryArchetypeType(PrimaryArchetypeType *T) {
-    printArchetypeCommon(T->getInterfaceType(), T);
+    printArchetypeCommon(T->getInterfaceType(), T->getGenericEnvironment());
   }
 
   void visitOpaqueTypeArchetypeType(OpaqueTypeArchetypeType *T) {
@@ -7044,7 +7060,7 @@ public:
 
     if (!paramTy) {
       assert(interfaceTy->is<DependentMemberType>());
-      printArchetypeCommon(interfaceTy, T);
+      printArchetypeCommon(interfaceTy, T->getGenericEnvironment());
       return;
     }
 
@@ -7129,7 +7145,7 @@ public:
   }
 
   void visitPackArchetypeType(PackArchetypeType *T) {
-    printArchetypeCommon(T->getInterfaceType(), T);
+    printArchetypeCommon(T->getInterfaceType(), T->getGenericEnvironment());
   }
 
   void visitGenericTypeParamType(GenericTypeParamType *T) {

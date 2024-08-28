@@ -18,6 +18,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTSynthesis.h"
 #include "swift/AST/AnyFunctionRef.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -93,6 +94,58 @@ static llvm::cl::opt<bool> SkipConvertEscapeToNoescapeAttributes(
 static llvm::cl::opt<bool> AllowCriticalEdges("allow-critical-edges",
                                               llvm::cl::init(true));
 extern llvm::cl::opt<bool> SILPrintDebugInfo;
+
+void swift::verificationFailure(const Twine &complaint,
+              const SILInstruction *atInstruction,
+              const SILArgument *atArgument,
+              const std::function<void()> &extraContext) {
+  const SILFunction *f = nullptr;
+  StringRef funcName = "?";
+  if (atInstruction) {
+    f = atInstruction->getFunction();
+    funcName = f->getName();
+  } else if (atArgument) {
+    f = atArgument->getFunction();
+    funcName = f->getName();
+  }
+  if (ContinueOnFailure) {
+    llvm::dbgs() << "Begin Error in function " << funcName << "\n";
+  }
+
+  llvm::dbgs() << "SIL verification failed: " << complaint << "\n";
+  if (extraContext)
+    extraContext();
+
+  if (atInstruction) {
+    llvm::dbgs() << "Verifying instruction:\n";
+    atInstruction->printInContext(llvm::dbgs());
+  } else if (atArgument) {
+    llvm::dbgs() << "Verifying argument:\n";
+    atArgument->printInContext(llvm::dbgs());
+  }
+  if (ContinueOnFailure) {
+    llvm::dbgs() << "End Error in function " << funcName << "\n";
+    return;
+  }
+
+  if (f) {
+    llvm::dbgs() << "In function:\n";
+    f->print(llvm::dbgs());
+    if (DumpModuleOnFailure) {
+      // Don't do this by default because modules can be _very_ large.
+      llvm::dbgs() << "In module:\n";
+      f->getModule().print(llvm::dbgs());
+    }
+  }
+
+  // We abort by default because we want to always crash in
+  // the debugger.
+  if (AbortOnFailure)
+    abort();
+  else
+    exit(1);
+}
+
 
 // The verifier is basically all assertions, so don't compile it with NDEBUG to
 // prevent release builds from triggering spurious unused variable warnings.
@@ -922,45 +975,7 @@ public:
                 const std::function<void()> &extraContext = nullptr) {
     if (condition) return;
 
-    StringRef funcName;
-    if (CurInstruction)
-      funcName = CurInstruction->getFunction()->getName();
-    else if (CurArgument)
-      funcName = CurArgument->getFunction()->getName();
-    if (ContinueOnFailure) {
-      llvm::dbgs() << "Begin Error in function " << funcName << "\n";
-    }
-
-    llvm::dbgs() << "SIL verification failed: " << complaint << "\n";
-    if (extraContext)
-      extraContext();
-
-    if (CurInstruction) {
-      llvm::dbgs() << "Verifying instruction:\n";
-      CurInstruction->printInContext(llvm::dbgs());
-    } else if (CurArgument) {
-      llvm::dbgs() << "Verifying argument:\n";
-      CurArgument->printInContext(llvm::dbgs());
-    }
-    if (ContinueOnFailure) {
-      llvm::dbgs() << "End Error in function " << funcName << "\n";
-      return;
-    }
-
-    llvm::dbgs() << "In function:\n";
-    F.print(llvm::dbgs());
-    if (DumpModuleOnFailure) {
-      // Don't do this by default because modules can be _very_ large.
-      llvm::dbgs() << "In module:\n";
-      F.getModule().print(llvm::dbgs());
-    }
-
-    // We abort by default because we want to always crash in
-    // the debugger.
-    if (AbortOnFailure)
-      abort();
-    else
-      exit(1);
+    verificationFailure(complaint, CurInstruction, CurArgument, extraContext);
   }
 #define require(condition, complaint) \
   _require(bool(condition), complaint ": " #condition)
@@ -3517,8 +3532,7 @@ public:
     if (auto *AEBI = dyn_cast<AllocExistentialBoxInst>(PEBI->getOperand())) {
       // The lowered type must be the properly-abstracted form of the AST type.
       SILType exType = AEBI->getExistentialType();
-      auto archetype = OpenedArchetypeType::get(exType.getASTType(),
-                                                F.getGenericSignature());
+      auto archetype = OpenedArchetypeType::get(exType.getASTType());
 
       auto loweredTy = F.getLoweredType(Lowering::AbstractionPattern(archetype),
                                         AEBI->getFormalConcreteType())
@@ -4592,8 +4606,7 @@ public:
             "existential type");
     
     // The lowered type must be the properly-abstracted form of the AST type.
-    auto archetype = OpenedArchetypeType::get(exType.getASTType(),
-                                              F.getGenericSignature());
+    auto archetype = OpenedArchetypeType::get(exType.getASTType());
 
     auto loweredTy = F.getLoweredType(Lowering::AbstractionPattern(archetype),
                                       AEI->getFormalConcreteType())
@@ -4622,8 +4635,7 @@ public:
             "init_existential_value result must not be an address");
     // The operand must be at the right abstraction level for the existential.
     SILType exType = IEI->getType();
-    auto archetype = OpenedArchetypeType::get(exType.getASTType(),
-                                              F.getGenericSignature());
+    auto archetype = OpenedArchetypeType::get(exType.getASTType());
     auto loweredTy = F.getLoweredType(Lowering::AbstractionPattern(archetype),
                                       IEI->getFormalConcreteType());
     requireSameType(
@@ -4655,8 +4667,7 @@ public:
     
     // The operand must be at the right abstraction level for the existential.
     SILType exType = IEI->getType();
-    auto archetype = OpenedArchetypeType::get(exType.getASTType(),
-                                              F.getGenericSignature());
+    auto archetype = OpenedArchetypeType::get(exType.getASTType());
     auto loweredTy = F.getLoweredType(Lowering::AbstractionPattern(archetype),
                                       IEI->getFormalConcreteType());
     requireSameType(concreteType, loweredTy,
@@ -6270,10 +6281,9 @@ public:
         auto archetype = dyn_cast<ElementArchetypeType>(type);
         if (!archetype)
           return type;
-        if (!archetype->isRoot())
-          return Type();
 
-        auto it = allOpened.find(type->getCanonicalType());
+        auto root = archetype->getRoot();
+        auto it = allOpened.find(root->getCanonicalType());
         assert(it != allOpened.end());
 
         auto pack = it->second;
@@ -6284,13 +6294,13 @@ public:
         } else {
           assert(!indexedShape && "pack substitution doesn't match in shape");
         }
-        return packElementType;
-      };
-      auto substConformances = [&](CanType dependentType,
-                                   Type conformingType,
-                                   ProtocolDecl *protocol) -> ProtocolConformanceRef {
-        // FIXME: This violates the spirit of this verifier check.
-        return ModuleDecl::lookupConformance(conformingType, protocol);
+
+        if (archetype->isRoot())
+          return packElementType;
+
+        return archetype->getInterfaceType()->castTo<DependentMemberType>()
+            ->substRootParam(packElementType, LookUpConformanceInModule(),
+                             std::nullopt);
       };
 
       // If the pack components and expected element types are SIL types,
@@ -6302,13 +6312,18 @@ public:
           SILType::getPrimitiveObjectType(indexedElementType);
         auto substTargetElementSILType =
           targetElementSILType.subst(F.getModule(),
-                                     substTypes, substConformances);
+                                     substTypes,
+                                     LookUpConformanceInModule(),
+                                     CanGenericSignature(),
+                                     SubstFlags::PreservePackExpansionLevel |
+                                     SubstFlags::SubstitutePrimaryArchetypes |
+                                     SubstFlags::SubstituteLocalArchetypes);
         requireSameType(indexedElementSILType, substTargetElementSILType,
                         "lanewise-substituted pack element type didn't "
                         "match expected element type");
       } else {
         auto substTargetElementType =
-          targetElementType.subst(substTypes, substConformances)
+          targetElementType.subst(substTypes, LookUpConformanceInModule())
                            ->getCanonicalType();
         requireSameType(indexedElementType, substTargetElementType,
                         "lanewise-substituted pack element type didn't "

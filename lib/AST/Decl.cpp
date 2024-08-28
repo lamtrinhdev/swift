@@ -23,6 +23,7 @@
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/CaptureInfo.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DeclExportabilityVisitor.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSema.h"
@@ -1012,6 +1013,13 @@ bool Decl::preconcurrency() const {
   }
 
   return false;
+}
+
+bool Decl::isUnsafe() const {
+  return evaluateOrDefault(
+      getASTContext().evaluator,
+      IsUnsafeRequest{const_cast<Decl *>(this)},
+      false);
 }
 
 Type AbstractFunctionDecl::getThrownInterfaceType() const {
@@ -3476,12 +3484,12 @@ static Type mapSignatureFunctionType(ASTContext &ctx, Type type,
 
 /// Map a type within the signature of a declaration.
 static Type mapSignatureType(ASTContext &ctx, Type type) {
-  return type.transform([&](Type type) -> Type {
+  return type.transformRec([&](Type type) -> std::optional<Type> {
       if (type->is<FunctionType>()) {
         return mapSignatureFunctionType(ctx, type, false, false, false, 1);
       }
 
-      return type;
+      return std::nullopt;
     });
 }
 
@@ -4211,6 +4219,21 @@ bool ValueDecl::isUsableFromInline() const {
   return false;
 }
 
+bool ValueDecl::isInterfacePackageEffectivelyPublic() const {
+  // If a package decl has a @usableFromInline (or other inlinable)
+  // attribute, and is defined in a module built from interface, it
+  // can be referenced by another module that imports it even though
+  // the defining interface module does not have package-name (such
+  // as public or private interface); in such case, the decl is treated
+  // as public and access checks in sema are skipped.
+  // We might need to add another check here to ensure the interface
+  // was part of the same package before the package-name was removed.
+  return getFormalAccess() == AccessLevel::Package &&
+         isUsableFromInline() &&
+         getModuleContext()->getPackageName().empty() &&
+         getModuleContext()->isBuiltFromInterface();
+}
+
 bool ValueDecl::shouldHideFromEditor() const {
   // Hide private stdlib declarations.
   if (isPrivateStdlibDecl(/*treatNonBuiltinProtocolsAsPublic*/ false) ||
@@ -4302,6 +4325,9 @@ static AccessLevel getAdjustedFormalAccess(const ValueDecl *VD,
   // access level of the current declaration to be as open as possible.
   if (useDC && VD->getASTContext().isAccessControlDisabled())
     return getMaximallyOpenAccessFor(VD);
+
+  if (VD->isInterfacePackageEffectivelyPublic())
+    return AccessLevel::Public;
 
   if (treatUsableFromInlineAsPublic &&
       access < AccessLevel::Public &&
@@ -4485,6 +4511,8 @@ getAccessScopeForFormalAccess(const ValueDecl *VD,
   case AccessLevel::Package: {
     auto pkg = resultDC->getPackageContext(/*lookupIfNotCurrent*/ true);
     if (!pkg) {
+      if (VD->isInterfacePackageEffectivelyPublic())
+        return AccessScope::getPublic();
       // Instead of reporting and failing early, return the scope of resultDC to
       // allow continuation (should still non-zero exit later if in script mode)
       return AccessScope(resultDC);
@@ -4618,6 +4646,9 @@ static bool checkAccess(const DeclContext *useDC, const ValueDecl *VD,
     return false;
 
   if (VD->getASTContext().isAccessControlDisabled())
+    return true;
+
+  if (VD->isInterfacePackageEffectivelyPublic())
     return true;
 
   auto access = getAccessLevel();
@@ -5129,8 +5160,8 @@ NominalTypeDecl::canConformTo(InvertibleProtocolKind ip) const {
   Type selfTy = getDeclaredInterfaceType();
   assert(selfTy);
 
-  auto conformance = ModuleDecl::lookupConformance(selfTy, proto,
-      /*allowMissing=*/false);
+  auto conformance = swift::lookupConformance(selfTy, proto,
+                                              /*allowMissing=*/false);
 
   if (conformance.isInvalid())
     return TypeDecl::CanBeInvertible::Never;
@@ -6559,6 +6590,11 @@ bool EnumDecl::hasOnlyCasesWithoutAssociatedValues() const {
   return !hasAssociatedValues;
 }
 
+bool EnumDecl::treatAsExhaustiveForDiags(const DeclContext *useDC) const {
+  return isFormallyExhaustive(useDC) ||
+         (useDC && getModuleContext()->inSamePackage(useDC->getParentModule()));
+}
+
 bool EnumDecl::isFormallyExhaustive(const DeclContext *useDC) const {
   // Enums explicitly marked frozen are exhaustive.
   if (getAttrs().hasAttribute<FrozenAttr>())
@@ -6576,13 +6612,9 @@ bool EnumDecl::isFormallyExhaustive(const DeclContext *useDC) const {
     return true;
 
   // Non-public, non-versioned enums are always exhaustive.
-  AccessScope accessScope = getFormalAccessScope(/*useDC*/nullptr,
-                                                 /*respectVersioned*/true);
-  // Both public and package enums should behave the same unless
-  // package enum is optimized with bypassing resilience checks.
+  AccessScope accessScope = getFormalAccessScope(/*useDC*/ nullptr,
+                                                 /*respectVersioned*/ true);
   if (!accessScope.isPublicOrPackage())
-    return true;
-  if (useDC && bypassResilienceInPackage(useDC->getParentModule()))
     return true;
 
   // All other checks are use-site specific; with no further information, the
@@ -6615,11 +6647,13 @@ bool EnumDecl::isEffectivelyExhaustive(ModuleDecl *M,
   if (isObjC())
     return false;
 
-  // Otherwise, the only non-exhaustive cases are those that don't have a fixed
-  // layout.
-  assert(isFormallyExhaustive(M) == !isResilient(M,ResilienceExpansion::Maximal)
-         && "ignoring the effects of @inlinable, @testable, and @objc, "
-            "these should match up");
+  // Otherwise, the only non-exhaustive enums are those that don't have
+  // a fixed layout; however, they are treated as exhaustive if package
+  // optimization is enabled.
+  assert((isFormallyExhaustive(M) || bypassResilienceInPackage(M)) ==
+             !isResilient(M, ResilienceExpansion::Maximal) &&
+         "ignoring the effects of @inlinable, @testable, and @objc, "
+         "these should match up");
   return !isResilient(M, expansion);
 }
       
@@ -8367,8 +8401,9 @@ void VarDecl::emitLetToVarNoteIfSimple(DeclContext *UseDC) const {
       }
 
       auto &d = getASTContext().Diags;
+      auto descriptiveKindName = Decl::getDescriptiveKindName(FD->getDescriptiveKind());
       auto diags = d.diagnose(FD->getFuncLoc(), diag::change_to_mutating,
-                              isa<AccessorDecl>(FD));
+                              isa<AccessorDecl>(FD), descriptiveKindName);
       if (auto nonmutatingAttr =
               FD->getAttrs().getAttribute<NonMutatingAttr>()) {
         diags.fixItReplace(nonmutatingAttr->getLocation(), "mutating");
@@ -11295,10 +11330,15 @@ bool VarDecl::isSelfParamCaptureIsolated() const {
 }
 
 ActorIsolation swift::getActorIsolation(ValueDecl *value) {
+  return getInferredActorIsolation(value).isolation;
+}
+
+InferredActorIsolation
+swift::getInferredActorIsolation(ValueDecl *value) {
   auto &ctx = value->getASTContext();
   return evaluateOrDefault(
       ctx.evaluator, ActorIsolationRequest{value},
-      ActorIsolation::forUnspecified());
+      InferredActorIsolation::forUnspecified());
 }
 
 ActorIsolation swift::getActorIsolationOfContext(
@@ -11619,6 +11659,10 @@ ActorIsolation::ActorIsolation(Kind kind, Expr *actor,
     : actorInstance(actor), kind(kind), isolatedByPreconcurrency(false),
       silParsed(false), parameterIndex(parameterIndex) {}
 
+ActorIsolation::ActorIsolation(Kind kind, Type globalActor)
+    : globalActor(globalActor), kind(kind), isolatedByPreconcurrency(false),
+      silParsed(false), parameterIndex(0) {}
+
 ActorIsolation
 ActorIsolation::forActorInstanceParameter(Expr *actor,
                                           unsigned parameterIndex) {
@@ -11638,7 +11682,7 @@ ActorIsolation::forActorInstanceParameter(Expr *actor,
     auto baseType =
         memberRef->getBase()->getType()->getMetatypeInstanceType();
     if (auto globalActor = ctx.getProtocol(KnownProtocolKind::GlobalActor)) {
-      auto conformance = ModuleDecl::checkConformance(baseType, globalActor);
+      auto conformance = checkConformance(baseType, globalActor);
       if (conformance &&
           conformance.getWitnessByName(baseType, ctx.Id_shared) == declRef) {
         return ActorIsolation::forGlobalActor(baseType);
@@ -11669,18 +11713,21 @@ ActorIsolation ActorIsolation::forActorInstanceSelf(NominalTypeDecl *selfDecl) {
 }
 
 NominalTypeDecl *ActorIsolation::getActor() const {
-  assert(getKind() == ActorInstance ||
-         getKind() == GlobalActor);
+  assert(getKind() == ActorInstance || getKind() == GlobalActor);
 
   if (silParsed)
     return nullptr;
+
+  if (getKind() == GlobalActor) {
+    return getGlobalActor()->getAnyNominal();
+  }
 
   Type actorType;
 
   if (auto *instance = actorInstance.dyn_cast<VarDecl *>()) {
     actorType = instance->getTypeInContext();
-  } else if (auto *instance = actorInstance.dyn_cast<Expr *>()) {
-    actorType = instance->getType();
+  } else if (auto *expr = actorInstance.dyn_cast<Expr *>()) {
+    actorType = expr->getType();
   }
 
   if (actorType) {
@@ -11689,31 +11736,6 @@ NominalTypeDecl *ActorIsolation::getActor() const {
     }
     return actorType
         ->getReferenceStorageReferent()->getAnyActor();
-  }
-
-  return actorInstance.get<NominalTypeDecl *>();
-}
-
-NominalTypeDecl *ActorIsolation::getActorOrNullPtr() const {
-  if (getKind() != ActorInstance || getKind() != GlobalActor)
-    return nullptr;
-
-  if (silParsed)
-    return nullptr;
-
-  Type actorType;
-
-  if (auto *instance = actorInstance.dyn_cast<VarDecl *>()) {
-    actorType = instance->getTypeInContext();
-  } else if (auto *instance = actorInstance.dyn_cast<Expr *>()) {
-    actorType = instance->getType();
-  }
-
-  if (actorType) {
-    if (auto wrapped = actorType->getOptionalObjectType()) {
-      actorType = wrapped;
-    }
-    return actorType->getReferenceStorageReferent()->getAnyActor();
   }
 
   return actorInstance.get<NominalTypeDecl *>();
@@ -11753,7 +11775,10 @@ bool ActorIsolation::isDistributedActor() const {
   if (silParsed)
     return false;
 
-  return getKind() == ActorInstance && getActor()->isDistributedActor();
+  if (getKind() != ActorInstance)
+    return false;
+
+  return getActor()->isDistributedActor();
 }
 
 bool ActorIsolation::isEqual(const ActorIsolation &lhs,

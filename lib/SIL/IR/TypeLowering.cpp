@@ -16,6 +16,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/AnyFunctionRef.h"
 #include "swift/AST/CanTypeVisitor.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSIL.h"
@@ -3086,7 +3087,7 @@ void TypeConverter::verifyTrivialLowering(const TypeLowering &lowering,
   if (substType->hasTypeParameter())
     return;
 
-  auto conformance = M.checkConformance(substType, bitwiseCopyableProtocol);
+  auto conformance = checkConformance(substType, bitwiseCopyableProtocol);
 
   if (auto *nominal = substType.getAnyNominal()) {
     auto *module = nominal->getModuleContext();
@@ -3194,7 +3195,7 @@ void TypeConverter::verifyTrivialLowering(const TypeLowering &lowering,
 
           // A BitwiseCopyable conformer appearing within its layout doesn't
           // explain why substType doesn't itself conform.
-          if (M.checkConformance(ty, bitwiseCopyableProtocol))
+          if (checkConformance(ty, bitwiseCopyableProtocol))
             return true;
 
           // ModuleTypes are trivial but don't warrant being given a
@@ -3311,7 +3312,7 @@ void TypeConverter::verifyTrivialLowering(const TypeLowering &lowering,
         /*visit=*/
         [&](auto ty, auto origTy, auto *field, auto index) -> bool {
           // Return false to indicate visiting a type parameter.
-          assert(M.checkConformance(ty, bitwiseCopyableProtocol) &&
+          assert(checkConformance(ty, bitwiseCopyableProtocol) &&
                  "leaf of non-trivial BitwiseCopyable type that doesn't "
                  "conform to BitwiseCopyable!?");
 
@@ -3551,8 +3552,7 @@ TypeConverter::computeLoweredRValueType(TypeExpansionContext forExpansion,
 
       // The Swift type directly corresponds to the lowered type.
       auto underlyingTy =
-          substOpaqueTypesWithUnderlyingTypes(substType, forExpansion,
-                                              /*allowLoweredTypes*/ true);
+          substOpaqueTypesWithUnderlyingTypes(substType, forExpansion);
       if (underlyingTy != substType) {
         underlyingTy =
             TC.computeLoweredRValueType(forExpansion, origType, underlyingTy);
@@ -3908,7 +3908,9 @@ getAnyFunctionRefInterfaceType(TypeConverter &TC,
     auto substType = Type(funcType).subst(
         MapLocalArchetypesOutOfContext(sig.baseGenericSig, sig.capturedEnvs),
         MakeAbstractConformanceForGenericType(),
-        SubstFlags::PreservePackExpansionLevel);
+        SubstFlags::PreservePackExpansionLevel |
+        SubstFlags::SubstitutePrimaryArchetypes |
+        SubstFlags::SubstituteLocalArchetypes);
     funcType = cast<FunctionType>(substType->getCanonicalType());
   }
 
@@ -4968,8 +4970,7 @@ TypeConverter::getInterfaceBoxTypeForCapture(ValueDecl *captured,
       return paramTy;
     },
     MakeAbstractConformanceForGenericType(),
-    SubstFlags::PreservePackExpansionLevel |
-    SubstFlags::AllowLoweredTypes)->getCanonicalType());
+    SubstFlags::PreservePackExpansionLevel)->getCanonicalType());
 }
 
 CanSILBoxType
@@ -4990,7 +4991,8 @@ TypeConverter::getInterfaceBoxTypeForCapture(ValueDecl *captured,
       mapOutOfContext,
       MakeAbstractConformanceForGenericType(),
       SubstFlags::PreservePackExpansionLevel |
-      SubstFlags::AllowLoweredTypes)->getCanonicalType();
+      SubstFlags::SubstitutePrimaryArchetypes |
+      SubstFlags::SubstituteLocalArchetypes)->getCanonicalType();
 
   // If the type is not dependent at all, we can form a concrete box layout.
   // We don't need to capture the generic environment.
@@ -5036,8 +5038,7 @@ TypeConverter::getContextBoxTypeForCapture(ValueDecl *captured,
   return cast<SILBoxType>(
     Type(boxType).subst(mapIntoContext,
                         LookUpConformanceInModule(),
-                        SubstFlags::PreservePackExpansionLevel |
-                        SubstFlags::AllowLoweredTypes)->getCanonicalType());
+                        SubstFlags::PreservePackExpansionLevel)->getCanonicalType());
 }
 
 CanSILBoxType TypeConverter::getBoxTypeForEnumElement(

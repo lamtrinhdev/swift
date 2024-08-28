@@ -17,7 +17,6 @@
 #include "llvm/Support/Compiler.h"
 #include "swift/Demangling/Demangler.h"
 #include "DemanglerAssert.h"
-#include "swift/Basic/Assertions.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/ManglingUtils.h"
 #include "swift/Demangling/Punycode.h"
@@ -481,9 +480,9 @@ Node* Node::findByKind(Node::Kind kind, int maxDepth) {
 // NodeFactory member functions //
 //////////////////////////////////
 
-void NodeFactory::freeSlabs(Slab *slab) {
+void NodeFactory::freeSlabs(AllocatedSlab *slab) {
   while (slab) {
-    Slab *prev = slab->Previous;
+    AllocatedSlab *prev = slab->Previous;
     free(slab);
     slab = prev;
   }
@@ -543,7 +542,7 @@ void NodeFactory::popCheckpoint(NodeFactory::Checkpoint checkpoint) {
     // checkpoint's slab is less than 1/16th of the current slab's space. We
     // won't repeatedly allocate and deallocate the current slab. The size
     // doubles each time so we'll quickly pass the threshold.
-    Slab *savedSlab = nullptr;
+    AllocatedSlab *savedSlab = nullptr;
     if (CurrentSlab) {
       size_t checkpointSlabFreeSpace = checkpoint.End - checkpoint.CurPtr;
       size_t currentSlabSize = End - (char *)(CurrentSlab + 1);
@@ -962,7 +961,7 @@ NodePointer Demangler::demangleSymbolicReference(unsigned char rawKind) {
 }
 
 NodePointer Demangler::demangleTypeAnnotation() {
-  switch (char c2 = nextChar()) {
+  switch (nextChar()) {
   case 'a':
     return createNode(Node::Kind::AsyncAnnotation);
   case 'A':
@@ -1019,7 +1018,7 @@ recur:
     case 'F': return demanglePlainFunction();
     case 'G': return demangleBoundGenericType();
     case 'H':
-      switch (char c2 = nextChar()) {
+      switch (nextChar()) {
       case 'A': return demangleDependentProtocolConformanceAssociated();
       case 'C': return demangleConcreteProtocolConformance();
       case 'D': return demangleDependentProtocolConformanceRoot();
@@ -1200,7 +1199,7 @@ NodePointer Demangler::createSwiftType(Node::Kind typeKind, const char *name) {
 }
 
 NodePointer Demangler::demangleStandardSubstitution() {
-  switch (char c = nextChar()) {
+  switch (nextChar()) {
     case 'o':
       return createNode(Node::Kind::Module, MANGLING_MODULE_OBJC);
     case 'C':
@@ -2845,18 +2844,20 @@ NodePointer Demangler::demangleThunkOrSpecialization() {
       return Thunk;
     }
     case 'g':
-      return demangleGenericSpecialization(Node::Kind::GenericSpecialization);
+      return demangleGenericSpecialization(Node::Kind::GenericSpecialization, nullptr);
     case 'G':
       return demangleGenericSpecialization(Node::Kind::
-                                          GenericSpecializationNotReAbstracted);
+                                          GenericSpecializationNotReAbstracted, nullptr);
     case 'B':
       return demangleGenericSpecialization(Node::Kind::
-                                      GenericSpecializationInResilienceDomain);
+                                      GenericSpecializationInResilienceDomain, nullptr);
+    case 't':
+      return demangleGenericSpecializationWithDroppedArguments();
     case 's':
       return demangleGenericSpecialization(
-          Node::Kind::GenericSpecializationPrespecialized);
+          Node::Kind::GenericSpecializationPrespecialized, nullptr);
     case 'i':
-      return demangleGenericSpecialization(Node::Kind::InlinedGenericFunction);
+      return demangleGenericSpecialization(Node::Kind::InlinedGenericFunction, nullptr);
     case 'p': {
       NodePointer Spec = demangleSpecAttributes(Node::Kind::
                                                 GenericPartialSpecialization);
@@ -3112,7 +3113,7 @@ NodePointer Demangler::demangleDifferentiabilityWitness() {
     result = addChild(result, node);
   result->reverseChildren();
   MangledDifferentiabilityKind kind;
-  switch (auto c = nextChar()) {
+  switch (nextChar()) {
   case 'f': kind = MangledDifferentiabilityKind::Forward; break;
   case 'r': kind = MangledDifferentiabilityKind::Reverse; break;
   case 'd': kind = MangledDifferentiabilityKind::Normal; break;
@@ -3144,7 +3145,7 @@ NodePointer Demangler::demangleIndexSubset() {
 
 NodePointer Demangler::demangleDifferentiableFunctionType() {
   MangledDifferentiabilityKind kind;
-  switch (auto c = nextChar()) {
+  switch (nextChar()) {
   case 'f': kind = MangledDifferentiabilityKind::Forward; break;
   case 'r': kind = MangledDifferentiabilityKind::Reverse; break;
   case 'd': kind = MangledDifferentiabilityKind::Normal; break;
@@ -3157,7 +3158,7 @@ NodePointer Demangler::demangleDifferentiableFunctionType() {
 
 static std::optional<MangledLifetimeDependenceKind>
 getMangledLifetimeDependenceKind(char nextChar) {
-  switch (auto c = nextChar) {
+  switch (nextChar) {
   case 's':
     return MangledLifetimeDependenceKind::Scope;
   case 'i':
@@ -3203,10 +3204,18 @@ std::string Demangler::demangleBridgedMethodParams() {
   return Str;
 }
 
-NodePointer Demangler::demangleGenericSpecialization(Node::Kind SpecKind) {
+NodePointer Demangler::demangleGenericSpecialization(Node::Kind SpecKind,
+                                                     NodePointer droppedArguments) {
   NodePointer Spec = demangleSpecAttributes(SpecKind);
   if (!Spec)
     return nullptr;
+
+  if (droppedArguments) {
+    for (NodePointer a : *droppedArguments) {
+      Spec->addChild(a, *this);
+    }
+  }
+
   NodePointer TyList = popTypeList();
   if (!TyList)
     return nullptr;
@@ -3215,6 +3224,24 @@ NodePointer Demangler::demangleGenericSpecialization(Node::Kind SpecKind) {
                    *this);
   }
   return Spec;
+}
+
+NodePointer Demangler::demangleGenericSpecializationWithDroppedArguments() {
+  pushBack();
+  NodePointer tmp = createNode(Node::Kind::GenericSpecialization);
+  while (nextIf('t')) {
+    int n = demangleNatural();
+    addChild(tmp, createNode(Node::Kind::DroppedArgument, n < 0 ? 0 : n + 1));
+  }
+  Node::Kind specKind;
+  switch (nextChar()) {
+    case 'g': specKind = Node::Kind::GenericSpecialization; break;
+    case 'G': specKind = Node::Kind::GenericSpecializationNotReAbstracted; break;
+    case 'B': specKind = Node::Kind::GenericSpecializationInResilienceDomain; break;
+    default:
+      return nullptr;
+  }
+  return demangleGenericSpecialization(specKind, tmp);
 }
 
 NodePointer Demangler::demangleFunctionSpecialization() {
@@ -3430,20 +3457,15 @@ NodePointer Demangler::addFuncSpecParamNumber(NodePointer Param,
 }
 
 NodePointer Demangler::demangleSpecAttributes(Node::Kind SpecKind) {
-  bool metatypeParamsRemoved = nextIf('m');
   bool isSerialized = nextIf('q');
   bool asyncRemoved = nextIf('a');
 
   int PassID = (int)nextChar() - '0';
   if (PassID < 0 || PassID >= MAX_SPECIALIZATION_PASS) {
-    assert(false && "unexpected pass id");
     return nullptr;
   }
 
   NodePointer SpecNd = createNode(SpecKind);
-
-  if (metatypeParamsRemoved)
-    SpecNd->addChild(createNode(Node::Kind::MetatypeParamsRemoved), *this);
 
   if (isSerialized)
     SpecNd->addChild(createNode(Node::Kind::IsSerialized),
@@ -3660,7 +3682,7 @@ NodePointer Demangler::demangleWitness() {
     case 'z': {
       auto declList = createNode(Node::Kind::GlobalVariableOnceDeclList);
       std::vector<NodePointer> vars;
-      while (auto sig = popNode(Node::Kind::FirstElementMarker)) {
+      while (popNode(Node::Kind::FirstElementMarker)) {
         auto identifier = popNode(isDeclName);
         if (!identifier)
           return nullptr;
@@ -3711,7 +3733,7 @@ NodePointer Demangler::demangleSpecialType() {
     case 'j':
       return demangleSymbolicExtendedExistentialType();
     case 'z':
-      switch (auto cchar = nextChar()) {
+      switch (nextChar()) {
       case 'B':
         return popFunctionType(Node::Kind::ObjCBlock, true);
       case 'C':

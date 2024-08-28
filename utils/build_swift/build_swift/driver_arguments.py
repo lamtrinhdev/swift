@@ -213,6 +213,7 @@ def _apply_default_arguments(args):
         args.test_android = False
         args.test_cmark = False
         args.test_swiftpm = False
+        args.test_foundation = False
         args.test_swift_driver = False
         args.test_swiftsyntax = False
         args.test_indexstoredb = False
@@ -808,6 +809,16 @@ def create_argument_parser():
     option(['--wasmkit'], toggle_true('build_wasmkit'),
            help='build WasmKit')
 
+    option('--swift-testing', toggle_true('build_swift_testing'),
+           help='build Swift Testing')
+    option('--install-swift-testing', toggle_true('install_swift_testing'),
+           help='install Swift Testing')
+    option('--swift-testing-macros', toggle_true('build_swift_testing_macros'),
+           help='build Swift Testing macro plugin')
+    option('--install-swift-testing-macros',
+           toggle_true('install_swift_testing_macros'),
+           help='install Swift Testing macro plugin')
+
     option('--xctest', toggle_true('build_xctest'),
            help='build xctest')
 
@@ -1137,6 +1148,10 @@ def create_argument_parser():
     option('--build-swift-stdlib-static-print', toggle_true,
            help='Build constant-folding print() support')
 
+    option('--build-embedded-stdlib', toggle_true,
+           default=True,
+           help='Build embedded stdlib')
+
     option('--build-embedded-stdlib-cross-compiling', toggle_true,
            help='Build embedded stdlib for cross-compiling targets.')
 
@@ -1312,6 +1327,8 @@ def create_argument_parser():
            help='skip testing cmark')
     option('--skip-test-swiftpm', toggle_false('test_swiftpm'),
            help='skip testing swiftpm')
+    option('--skip-test-foundation', toggle_false('test_foundation'),
+           help='skip testing Foundation')
     option('--skip-test-swift-driver', toggle_false('test_swift_driver'),
            help='skip testing Swift driver')
     option('--skip-test-swiftsyntax', toggle_false('test_swiftsyntax'),

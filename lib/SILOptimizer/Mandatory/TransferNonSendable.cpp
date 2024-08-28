@@ -13,6 +13,7 @@
 #define DEBUG_TYPE "transfer-non-sendable"
 
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/Concurrency.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ProtocolConformance.h"
@@ -55,22 +56,67 @@ using Region = PartitionPrimitives::Region;
 
 } // namespace
 
+// This option is used so we can test typed errors. Typed errors are a fallback
+// case which are emitted when we are unable to infer the name of a value. We in
+// most cases do succeed inferring, so it makes sense to add an asserts only
+// option that can be used by the compiler to test that we emit these correctly.
+static llvm::cl::opt<bool> ForceTypedErrors(
+    "sil-regionbasedisolation-force-use-of-typed-errors",
+    llvm::cl::desc("Force the usage of typed instead of named errors to make "
+                   "it easier to test typed errors"),
+    llvm::cl::Hidden);
+
 //===----------------------------------------------------------------------===//
 //                              MARK: Utilities
 //===----------------------------------------------------------------------===//
 
+static SILValue stripFunctionConversions(SILValue val) {
+  while (true) {
+    if (auto ti = dyn_cast<ThinToThickFunctionInst>(val)) {
+      val = ti->getOperand();
+      continue;
+    }
+
+    if (auto cfi = dyn_cast<ConvertFunctionInst>(val)) {
+      val = cfi->getOperand();
+      continue;
+    }
+
+    if (auto cvt = dyn_cast<ConvertEscapeToNoEscapeInst>(val)) {
+      val = cvt->getOperand();
+      continue;
+    }
+
+    break;
+  }
+
+  return val;
+}
+
 static std::optional<DiagnosticBehavior>
-getDiagnosticBehaviorLimitForValue(SILValue value) {
-  auto *nom = value->getType().getNominalOrBoundGenericNominal();
-  if (!nom)
-    return {};
+getDiagnosticBehaviorLimitForCapturedValue(SILFunction *fn,
+                                           CapturedValue value) {
+  ValueDecl *decl = value.getDecl();
+  auto *ctx = decl->getInnermostDeclContext();
+  auto type = fn->mapTypeIntoContext(decl->getInterfaceType());
+  return type->getConcurrencyDiagnosticBehaviorLimit(ctx);
+}
 
-  auto declRef = value->getFunction()->getDeclRef();
-  if (!declRef)
-    return {};
-
-  auto *fromDC = declRef.getInnermostDeclContext();
-  return getConcurrencyDiagnosticBehaviorLimit(nom, fromDC);
+/// Find the most conservative diagnostic behavior by taking the max over all
+/// DiagnosticBehavior for the captured values.
+static std::optional<DiagnosticBehavior>
+getDiagnosticBehaviorLimitForCapturedValues(
+    SILFunction *fn, ArrayRef<CapturedValue> capturedValues) {
+  std::optional<DiagnosticBehavior> diagnosticBehavior;
+  for (auto value : capturedValues) {
+    auto lhs = diagnosticBehavior.value_or(DiagnosticBehavior::Unspecified);
+    auto rhs = getDiagnosticBehaviorLimitForCapturedValue(fn, value).value_or(
+        DiagnosticBehavior::Unspecified);
+    auto result = lhs.merge(rhs);
+    if (result != DiagnosticBehavior::Unspecified)
+      diagnosticBehavior = result;
+  }
+  return diagnosticBehavior;
 }
 
 static std::optional<SILDeclRef> getDeclRefForCallee(SILInstruction *inst) {
@@ -152,6 +198,23 @@ static Expr *inferArgumentExprFromApplyExpr(ApplyExpr *sourceApply,
   }
 
   return foundExpr;
+}
+
+/// Attempt to infer a name for \p value. Returns none if we fail or if we are
+/// asked to force typed errors since we are testing.
+static std::optional<Identifier> inferNameHelper(SILValue value) {
+  if (ForceTypedErrors)
+    return {};
+  return VariableNameInferrer::inferName(value);
+}
+
+/// Attempt to infer a name and root for \p value. Returns none if we fail or if
+/// we are asked to force typed errors since we are testing.
+static std::optional<std::pair<Identifier, SILValue>>
+inferNameAndRootHelper(SILValue value) {
+  if (ForceTypedErrors)
+    return {};
+  return VariableNameInferrer::inferNameAndRoot(value);
 }
 
 //===----------------------------------------------------------------------===//
@@ -299,7 +362,7 @@ struct RequireLiveness {
 } // namespace
 
 void RequireLiveness::processDefBlock() {
-  LLVM_DEBUG(llvm::dbgs() << "    Processing def block!\n");
+  REGIONBASEDISOLATION_LOG(llvm::dbgs() << "    Processing def block!\n");
   // First walk from the beginning of the block to the transfer instruction to
   // see if we have any requires before our def. Once we find one, we can skip
   // the traversal and jump straight to the transfer.
@@ -308,8 +371,9 @@ void RequireLiveness::processDefBlock() {
        ii != ie; ++ii) {
     if (allRequires.contains(&*ii) && !firstRequireBeforeTransferInDefBlock) {
       firstRequireBeforeTransferInDefBlock = &*ii;
-      LLVM_DEBUG(llvm::dbgs() << "        Found transfer before def: "
-                              << *firstRequireBeforeTransferInDefBlock);
+      REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                               << "        Found transfer before def: "
+                               << *firstRequireBeforeTransferInDefBlock);
       break;
     }
   }
@@ -326,7 +390,8 @@ void RequireLiveness::processDefBlock() {
       continue;
 
     finalRequires.insert(&*ii);
-    LLVM_DEBUG(llvm::dbgs() << "        Found transfer after def: " << *ii);
+    REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                             << "        Found transfer after def: " << *ii);
     return;
   }
 }
@@ -343,13 +408,14 @@ void RequireLiveness::processNonDefBlock(SILBasicBlock *block) {
 
 template <typename Collection>
 void RequireLiveness::process(Collection requireInstList) {
-  LLVM_DEBUG(llvm::dbgs() << "==> Performing Require Liveness for: "
-                          << *transferInst);
+  REGIONBASEDISOLATION_LOG(
+      llvm::dbgs() << "==> Performing Require Liveness for: " << *transferInst);
 
   // Then put all of our requires into our allRequires set.
   BasicBlockWorklist initializingWorklist(transferInst->getFunction());
   for (auto require : requireInstList) {
-    LLVM_DEBUG(llvm::dbgs() << "        Require Inst: " << **require);
+    REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                             << "        Require Inst: " << **require);
     allRequires.insert(*require);
     initializingWorklist.pushIfNotVisited(require->getParent());
   }
@@ -361,19 +427,20 @@ void RequireLiveness::process(Collection requireInstList) {
   // If we found /any/ requries after the transferInst, we can bail early since
   // that is guaranteed to dominate all further requires.
   if (!finalRequires.empty()) {
-    LLVM_DEBUG(
+    REGIONBASEDISOLATION_LOG(
         llvm::dbgs()
         << "        Found transfer after def in def block! Exiting early!\n");
     return;
   }
 
-  LLVM_DEBUG(llvm::dbgs() << "        Did not find transfer after def in def "
-                             "block! Walking blocks!\n");
+  REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                           << "        Did not find transfer after def in def "
+                              "block! Walking blocks!\n");
 
   // If we found a transfer in the def block before our def, add it to the block
   // state for the def.
   if (firstRequireBeforeTransferInDefBlock) {
-    LLVM_DEBUG(
+    REGIONBASEDISOLATION_LOG(
         llvm::dbgs()
         << "        Found a require before transfer! Adding to block state!\n");
     auto blockState = blockLivenessInfo.get(transferInst->getParent());
@@ -387,8 +454,9 @@ void RequireLiveness::process(Collection requireInstList) {
     for (auto &inst : *requireBlock) {
       if (!allRequires.contains(&inst))
         continue;
-      LLVM_DEBUG(llvm::dbgs() << "        Mapping Block bb"
-                              << requireBlock->getDebugID() << " to: " << inst);
+      REGIONBASEDISOLATION_LOG(llvm::dbgs() << "        Mapping Block bb"
+                                            << requireBlock->getDebugID()
+                                            << " to: " << inst);
       blockState.get()->setInst(generation, &inst);
       break;
     }
@@ -584,8 +652,11 @@ public:
       emitUnknownPatternError();
   }
 
+  SILFunction *getFunction() const { return transferOp->getFunction(); }
+
   std::optional<DiagnosticBehavior> getBehaviorLimit() const {
-    return getDiagnosticBehaviorLimitForValue(transferOp->get());
+    return transferOp->get()->getType().getConcurrencyDiagnosticBehavior(
+        getFunction());
   }
 
   /// If we can find a callee decl name, return that. None otherwise.
@@ -674,12 +745,22 @@ public:
 
   void emitTypedIsolationCrossing(SILLocation loc, Type inferredType,
                                   ApplyIsolationCrossing isolationCrossing) {
-    diagnoseError(
-        loc, diag::regionbasedisolation_transfer_yields_race_with_isolation,
-        inferredType, isolationCrossing.getCallerIsolation(),
-        isolationCrossing.getCalleeIsolation())
+    diagnoseError(loc, diag::regionbasedisolation_type_transfer_yields_race,
+                  inferredType)
         .highlight(loc.getSourceRange())
         .limitBehaviorIf(getBehaviorLimit());
+
+    if (auto calleeInfo = getTransferringCalleeInfo()) {
+      diagnoseNote(loc,
+                   diag::regionbasedisolation_type_use_after_transfer_callee,
+                   inferredType, isolationCrossing.getCalleeIsolation(),
+                   calleeInfo->first, calleeInfo->second,
+                   isolationCrossing.getCallerIsolation());
+    } else {
+      diagnoseNote(loc, diag::regionbasedisolation_type_use_after_transfer,
+                   inferredType, isolationCrossing.getCalleeIsolation(),
+                   isolationCrossing.getCallerIsolation());
+    }
     emitRequireInstDiagnostics();
   }
 
@@ -703,23 +784,18 @@ public:
 
   void emitTypedUseOfStronglyTransferredValue(SILLocation loc,
                                               Type inferredType) {
-    diagnoseError(
-        loc,
-        diag::
-            regionbasedisolation_transfer_yields_race_stronglytransferred_binding,
-        inferredType)
-        .highlight(loc.getSourceRange())
-        .limitBehaviorIf(getBehaviorLimit());
-    emitRequireInstDiagnostics();
-  }
-
-  void emitTypedRaceWithUnknownIsolationCrossing(SILLocation loc,
-                                                 Type inferredType) {
-    diagnoseError(loc,
-                  diag::regionbasedisolation_transfer_yields_race_no_isolation,
+    diagnoseError(loc, diag::regionbasedisolation_type_transfer_yields_race,
                   inferredType)
         .highlight(loc.getSourceRange())
         .limitBehaviorIf(getBehaviorLimit());
+    if (auto calleeInfo = getTransferringCalleeInfo()) {
+      diagnoseNote(loc,
+                   diag::regionbasedisolation_typed_use_after_sending_callee,
+                   inferredType, calleeInfo->first, calleeInfo->second);
+    } else {
+      diagnoseNote(loc, diag::regionbasedisolation_typed_use_after_sending,
+                   inferredType);
+    }
     emitRequireInstDiagnostics();
   }
 
@@ -753,11 +829,14 @@ public:
   void emitTypedIsolationCrossingDueToCapture(
       SILLocation loc, Type inferredType,
       ApplyIsolationCrossing isolationCrossing) {
-    diagnoseError(loc, diag::regionbasedisolation_isolated_capture_yields_race,
-                  inferredType, isolationCrossing.getCalleeIsolation(),
-                  isolationCrossing.getCallerIsolation())
+    diagnoseError(loc, diag::regionbasedisolation_type_transfer_yields_race,
+                  inferredType)
         .highlight(loc.getSourceRange())
         .limitBehaviorIf(getBehaviorLimit());
+    diagnoseNote(loc,
+                 diag::regionbasedisolation_type_isolated_capture_yields_race,
+                 inferredType, isolationCrossing.getCalleeIsolation(),
+                 isolationCrossing.getCallerIsolation());
     emitRequireInstDiagnostics();
   }
 
@@ -904,8 +983,7 @@ bool UseAfterTransferDiagnosticInferrer::initForIsolatedPartialApply(
     emittedDiagnostic = true;
 
     auto &state = transferringOpToStateMap.get(transferOp);
-    if (auto rootValueAndName =
-            VariableNameInferrer::inferNameAndRoot(transferOp->get())) {
+    if (auto rootValueAndName = inferNameAndRootHelper(transferOp->get())) {
       diagnosticEmitter.emitNamedIsolationCrossingDueToCapture(
           RegularLocation(std::get<0>(p).getLoc()), rootValueAndName->first,
           state.isolationInfo.getIsolationInfo(), std::get<2>(p));
@@ -1076,15 +1154,23 @@ void UseAfterTransferDiagnosticInferrer::infer() {
             .hasOption(SILParameterInfo::Sending)) {
 
       // First try to do the named diagnostic if we can find a name.
-      if (auto rootValueAndName =
-              VariableNameInferrer::inferNameAndRoot(transferOp->get())) {
+      if (auto rootValueAndName = inferNameAndRootHelper(transferOp->get())) {
         return diagnosticEmitter.emitNamedUseOfStronglyTransferredValue(
             baseLoc, rootValueAndName->first);
       }
 
+      // See if we have an ApplyExpr and if we can infer a better type.
+      Type type = baseInferredType;
+      if (auto *applyExpr =
+              transferOp->getUser()->getLoc().getAsASTNode<ApplyExpr>()) {
+        if (auto *foundExpr =
+                inferArgumentExprFromApplyExpr(applyExpr, fas, transferOp))
+          type = foundExpr->findOriginalType();
+      }
+
       // Otherwise, emit the typed diagnostic.
-      return diagnosticEmitter.emitTypedUseOfStronglyTransferredValue(
-          baseLoc, baseInferredType);
+      return diagnosticEmitter.emitTypedUseOfStronglyTransferredValue(baseLoc,
+                                                                      type);
     }
   }
 
@@ -1103,8 +1189,7 @@ void UseAfterTransferDiagnosticInferrer::infer() {
   if (auto *sourceApply = loc.getAsASTNode<ApplyExpr>()) {
     // Before we do anything further, see if we can find a name and emit a name
     // error.
-    if (auto rootValueAndName =
-            VariableNameInferrer::inferNameAndRoot(transferOp->get())) {
+    if (auto rootValueAndName = inferNameAndRootHelper(transferOp->get())) {
       auto &state = transferringOpToStateMap.get(transferOp);
       return diagnosticEmitter.emitNamedIsolationCrossingError(
           baseLoc, rootValueAndName->first,
@@ -1152,13 +1237,15 @@ void TransferNonSendableImpl::emitUseAfterTransferDiagnostics() {
   if (transferOpToRequireInstMultiMap.empty())
     return;
 
-  LLVM_DEBUG(llvm::dbgs() << "Emitting use after transfer diagnostics.\n");
+  REGIONBASEDISOLATION_LOG(
+      llvm::dbgs() << "Emitting Error. Kind: Use After Send diagnostics.\n");
 
   for (auto [transferOp, requireInsts] :
        transferOpToRequireInstMultiMap.getRange()) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "Transfer Op. Number: " << transferOp->getOperandNumber()
-               << ". User: " << *transferOp->getUser());
+    REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                             << "Transfer Op. Number: "
+                             << transferOp->getOperandNumber()
+                             << ". User: " << *transferOp->getUser());
 
     // Then look for our requires before we emit any error. We want to emit a
     // single we don't understand error if we do not find the require.
@@ -1229,6 +1316,8 @@ public:
 
   Operand *getOperand() const { return info.transferredOperand; }
 
+  SILFunction *getFunction() const { return getOperand()->getFunction(); }
+
   SILValue getNonTransferrableValue() const {
     return info.nonTransferrable.dyn_cast<SILValue>();
   }
@@ -1238,7 +1327,9 @@ public:
   }
 
   std::optional<DiagnosticBehavior> getBehaviorLimit() const {
-    return getDiagnosticBehaviorLimitForValue(info.transferredOperand->get());
+    return info.transferredOperand->get()
+        ->getType()
+        .getConcurrencyDiagnosticBehavior(getOperand()->getFunction());
   }
 
   /// If we can find a callee decl name, return that. None otherwise.
@@ -1274,17 +1365,30 @@ public:
         .limitBehaviorIf(getBehaviorLimit());
   }
 
-  void emitFunctionArgumentApply(SILLocation loc, Type type,
-                                 ApplyIsolationCrossing crossing) {
+  void emitPassToApply(SILLocation loc, Type inferredType,
+                       ApplyIsolationCrossing crossing) {
+    diagnoseError(loc, diag::regionbasedisolation_type_transfer_yields_race,
+                  inferredType)
+        .highlight(loc.getSourceRange())
+        .limitBehaviorIf(getBehaviorLimit());
+
     SmallString<64> descriptiveKindStr;
     {
       llvm::raw_svector_ostream os(descriptiveKindStr);
       getIsolationRegionInfo().printForDiagnostics(os);
     }
-    diagnoseError(loc, diag::regionbasedisolation_arg_transferred,
-                  descriptiveKindStr, type, crossing.getCalleeIsolation())
-        .highlight(getOperand()->getUser()->getLoc().getSourceRange())
-        .limitBehaviorIf(getBehaviorLimit());
+
+    if (auto calleeInfo = getTransferringCalleeInfo()) {
+      diagnoseNote(
+          loc,
+          diag::regionbasedisolation_typed_transferneversendable_via_arg_callee,
+          descriptiveKindStr, inferredType, crossing.getCalleeIsolation(),
+          calleeInfo->first, calleeInfo->second);
+    } else {
+      diagnoseNote(
+          loc, diag::regionbasedisolation_typed_transferneversendable_via_arg,
+          descriptiveKindStr, inferredType, crossing.getCalleeIsolation());
+    }
   }
 
   void emitNamedFunctionArgumentClosure(SILLocation loc, Identifier name,
@@ -1305,18 +1409,120 @@ public:
         .highlight(loc.getSourceRange());
   }
 
-  void emitFunctionArgumentApplyStronglyTransferred(SILLocation loc,
-                                                    Type type) {
+  void emitTypedSendingNeverSendableToSendingParam(SILLocation loc,
+                                                   Type inferredType) {
+    diagnoseError(loc, diag::regionbasedisolation_type_transfer_yields_race,
+                  inferredType)
+        .highlight(loc.getSourceRange())
+        .limitBehaviorIf(getBehaviorLimit());
+
     SmallString<64> descriptiveKindStr;
     {
       llvm::raw_svector_ostream os(descriptiveKindStr);
       getIsolationRegionInfo().printForDiagnostics(os);
     }
-    auto diag =
-        diag::regionbasedisolation_arg_passed_to_strongly_transferred_param;
-    diagnoseError(loc, diag, descriptiveKindStr, type)
-        .highlight(getOperand()->getUser()->getLoc().getSourceRange())
-        .limitBehaviorIf(getBehaviorLimit());
+
+    if (auto calleeInfo = getTransferringCalleeInfo()) {
+      diagnoseNote(
+          loc, diag::regionbasedisolation_typed_tns_passed_to_sending_callee,
+          descriptiveKindStr, inferredType, calleeInfo->first,
+          calleeInfo->second);
+    } else {
+      diagnoseNote(loc, diag::regionbasedisolation_typed_tns_passed_to_sending,
+                   descriptiveKindStr, inferredType);
+    }
+  }
+
+  /// Only use if we were able to find the actual isolated value.
+  void emitTypedSendingNeverSendableToSendingClosureParamDirectlyIsolated(
+      SILLocation loc, CapturedValue capturedValue) {
+    SmallString<64> descriptiveKindStr;
+    {
+      llvm::raw_svector_ostream os(descriptiveKindStr);
+      if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
+        os << "code in the current task";
+      } else {
+        getIsolationRegionInfo().printForDiagnostics(os);
+        os << " code";
+      }
+    }
+
+    diagnoseError(loc,
+                  diag::regionbasedisolation_typed_tns_passed_sending_closure,
+                  descriptiveKindStr)
+        .highlight(loc.getSourceRange())
+        .limitBehaviorIf(getDiagnosticBehaviorLimitForCapturedValue(
+            getFunction(), capturedValue));
+
+    auto capturedLoc = RegularLocation(capturedValue.getLoc());
+    if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
+      auto diag = diag::
+          regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_task_isolated;
+      diagnoseNote(capturedLoc, diag, capturedValue.getDecl()->getName());
+      return;
+    }
+
+    descriptiveKindStr.clear();
+    {
+      llvm::raw_svector_ostream os(descriptiveKindStr);
+      getIsolationRegionInfo().printForDiagnostics(os);
+    }
+
+    auto diag = diag::
+        regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value;
+    diagnoseNote(capturedLoc, diag, descriptiveKindStr,
+                 capturedValue.getDecl()->getName());
+  }
+
+  void emitTypedSendingNeverSendableToSendingClosureParam(
+      SILLocation loc, ArrayRef<CapturedValue> capturedValues) {
+    SmallString<64> descriptiveKindStr;
+    {
+      llvm::raw_svector_ostream os(descriptiveKindStr);
+      if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
+        os << "code in the current task";
+      } else {
+        getIsolationRegionInfo().printForDiagnostics(os);
+        os << " code";
+      }
+    }
+
+    auto behaviorLimit = getDiagnosticBehaviorLimitForCapturedValues(
+        getFunction(), capturedValues);
+    diagnoseError(loc,
+                  diag::regionbasedisolation_typed_tns_passed_sending_closure,
+                  descriptiveKindStr)
+        .highlight(loc.getSourceRange())
+        .limitBehaviorIf(behaviorLimit);
+
+    if (capturedValues.size() == 1) {
+      auto captured = capturedValues.front();
+      auto capturedLoc = RegularLocation(captured.getLoc());
+      if (getIsolationRegionInfo().getIsolationInfo().isTaskIsolated()) {
+        auto diag = diag::
+            regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_task_isolated;
+        diagnoseNote(capturedLoc, diag, captured.getDecl()->getName());
+        return;
+      }
+
+      descriptiveKindStr.clear();
+      {
+        llvm::raw_svector_ostream os(descriptiveKindStr);
+        getIsolationRegionInfo().printForDiagnostics(os);
+      }
+      auto diag = diag::
+          regionbasedisolation_typed_tns_passed_to_sending_closure_helper_have_value_region;
+      diagnoseNote(capturedLoc, diag, descriptiveKindStr,
+                   captured.getDecl()->getName());
+      return;
+    }
+
+    for (auto captured : capturedValues) {
+      auto capturedLoc = RegularLocation(captured.getLoc());
+      auto diag = diag::
+          regionbasedisolation_typed_tns_passed_to_sending_closure_helper_multiple_value;
+      diagnoseNote(capturedLoc, diag, captured.getDecl()->getName());
+    }
   }
 
   void emitNamedOnlyError(SILLocation loc, Identifier name) {
@@ -1374,8 +1580,8 @@ public:
     }
   }
 
-  void emitNamedFunctionArgumentApplyStronglyTransferred(SILLocation loc,
-                                                         Identifier varName) {
+  void emitNamedSendingNeverSendableToSendingParam(SILLocation loc,
+                                                   Identifier varName) {
     emitNamedOnlyError(loc, varName);
     SmallString<64> descriptiveKindStr;
     {
@@ -1456,12 +1662,13 @@ private:
 class TransferNonTransferrableDiagnosticInferrer {
   struct AutoClosureWalker;
 
+  RegionAnalysisValueMap &valueMap;
   TransferNonTransferrableDiagnosticEmitter diagnosticEmitter;
 
 public:
   TransferNonTransferrableDiagnosticInferrer(
-      TransferredNonTransferrableInfo info)
-      : diagnosticEmitter(info) {}
+      RegionAnalysisValueMap &valueMap, TransferredNonTransferrableInfo info)
+      : valueMap(valueMap), diagnosticEmitter(info) {}
 
   /// Gathers diagnostics. Returns false if we emitted a "I don't understand
   /// error". If we emit such an error, we should bail without emitting any
@@ -1475,9 +1682,93 @@ private:
   bool initForIsolatedPartialApply(
       Operand *op, AbstractClosureExpr *ace,
       std::optional<ActorIsolation> actualCallerIsolation = {});
+
+  bool initForSendingPartialApply(FullApplySite fas, Operand *pai);
+
+  std::optional<unsigned>
+  getIsolatedValuePartialApplyIndex(PartialApplyInst *pai,
+                                    SILValue isolatedValue) {
+    for (auto &paiOp : ApplySite(pai).getArgumentOperands()) {
+      if (valueMap.getTrackableValue(paiOp.get()).getRepresentative() ==
+          isolatedValue) {
+        // isolated_any causes all partial apply parameters to be shifted by 1
+        // due to the implicit isolated any parameter.
+        unsigned isIsolatedAny = pai->getFunctionType()->getIsolation() ==
+                                 SILFunctionTypeIsolation::Erased;
+        return ApplySite(pai).getAppliedArgIndex(paiOp) - isIsolatedAny;
+      }
+    }
+
+    return {};
+  }
 };
 
 } // namespace
+
+bool TransferNonTransferrableDiagnosticInferrer::initForSendingPartialApply(
+    FullApplySite fas, Operand *paiOp) {
+  auto *pai =
+      dyn_cast<PartialApplyInst>(stripFunctionConversions(paiOp->get()));
+  if (!pai)
+    return false;
+
+  // For now we want this to be really narrow and to only apply to closure
+  // literals.
+  auto *ce = pai->getLoc().getAsASTNode<ClosureExpr>();
+  if (!ce)
+    return false;
+
+  // Ok, we now know we have a partial apply and it is a closure literal. Lets
+  // see if we can find the exact thing that caused the closure literal to be
+  // actor isolated.
+  auto isolationInfo = diagnosticEmitter.getIsolationRegionInfo();
+  if (isolationInfo->hasIsolatedValue()) {
+    // Now that we have the value, see if that value is one of our captured
+    // values.
+    auto isolatedValue = isolationInfo->getIsolatedValue();
+    auto matchingElt = getIsolatedValuePartialApplyIndex(pai, isolatedValue);
+    if (matchingElt) {
+      // Ok, we found the matching element. Lets emit our diagnostic!
+      auto capture = ce->getCaptureInfo().getCaptures()[*matchingElt];
+      diagnosticEmitter
+          .emitTypedSendingNeverSendableToSendingClosureParamDirectlyIsolated(
+              ce, capture);
+      return true;
+    }
+  }
+
+  // Ok, we are not tracking an actual isolated value or we do not capture the
+  // isolated value directly... we need to be smarter here. First lets gather up
+  // all non-Sendable values captured by the closure.
+  SmallVector<CapturedValue, 8> nonSendableCaptures;
+  for (auto capture : ce->getCaptureInfo().getCaptures()) {
+    auto *decl = capture.getDecl();
+    auto type = decl->getInterfaceType()->getCanonicalType();
+    auto silType = SILType::getPrimitiveObjectType(type);
+    if (!SILIsolationInfo::isNonSendableType(silType, pai->getFunction()))
+      continue;
+
+    auto *fromDC = decl->getInnermostDeclContext();
+    auto *nom = silType.getNominalOrBoundGenericNominal();
+    if (nom && fromDC) {
+      if (auto diagnosticBehavior =
+              getConcurrencyDiagnosticBehaviorLimit(nom, fromDC)) {
+        if (*diagnosticBehavior == DiagnosticBehavior::Ignore)
+          continue;
+      }
+    }
+    nonSendableCaptures.push_back(capture);
+  }
+
+  // If we do not have any non-Sendable captures... bail.
+  if (nonSendableCaptures.empty())
+    return false;
+
+  // Otherwise, emit the diagnostic.
+  diagnosticEmitter.emitTypedSendingNeverSendableToSendingClosureParam(
+      ce, nonSendableCaptures);
+  return true;
+}
 
 bool TransferNonTransferrableDiagnosticInferrer::initForIsolatedPartialApply(
     Operand *op, AbstractClosureExpr *ace,
@@ -1586,11 +1877,16 @@ bool TransferNonTransferrableDiagnosticInferrer::run() {
     if (auto fas = FullApplySite::isa(op->getUser())) {
       if (fas.getArgumentParameterInfo(*op).hasOption(
               SILParameterInfo::Sending)) {
+        // Before we do anything, lets see if we are passing a sendable closure
+        // literal. If we do, we want to emit a special error that states which
+        // captured value caused the actual error.
+        if (initForSendingPartialApply(fas, op))
+          return true;
 
         // See if we can infer a name from the value.
         SmallString<64> resultingName;
-        if (auto varName = VariableNameInferrer::inferName(op->get())) {
-          diagnosticEmitter.emitNamedFunctionArgumentApplyStronglyTransferred(
+        if (auto varName = inferNameHelper(op->get())) {
+          diagnosticEmitter.emitNamedSendingNeverSendableToSendingParam(
               loc, *varName);
           return true;
         }
@@ -1600,8 +1896,9 @@ bool TransferNonTransferrableDiagnosticInferrer::run() {
                 inferArgumentExprFromApplyExpr(sourceApply, fas, op)) {
           type = inferredArgExpr->findOriginalType();
         }
-        diagnosticEmitter.emitFunctionArgumentApplyStronglyTransferred(loc,
-                                                                       type);
+
+        diagnosticEmitter.emitTypedSendingNeverSendableToSendingParam(loc,
+                                                                      type);
         return true;
       }
     }
@@ -1629,7 +1926,7 @@ bool TransferNonTransferrableDiagnosticInferrer::run() {
 
     // See if we can infer a name from the value.
     SmallString<64> resultingName;
-    if (auto name = VariableNameInferrer::inferName(op->get())) {
+    if (auto name = inferNameHelper(op->get())) {
       diagnosticEmitter.emitNamedIsolation(loc, *name, *isolation);
       return true;
     }
@@ -1644,7 +1941,7 @@ bool TransferNonTransferrableDiagnosticInferrer::run() {
       }
     }
 
-    diagnosticEmitter.emitFunctionArgumentApply(loc, type, *isolation);
+    diagnosticEmitter.emitPassToApply(loc, type, *isolation);
     return true;
   }
 
@@ -1659,8 +1956,8 @@ bool TransferNonTransferrableDiagnosticInferrer::run() {
   // See if we are in SIL and have an apply site specified isolation.
   if (auto fas = FullApplySite::isa(op->getUser())) {
     if (auto isolation = fas.getIsolationCrossing()) {
-      diagnosticEmitter.emitFunctionArgumentApply(
-          loc, op->get()->getType().getASTType(), *isolation);
+      diagnosticEmitter.emitPassToApply(loc, op->get()->getType().getASTType(),
+                                        *isolation);
       return true;
     }
   }
@@ -1677,7 +1974,7 @@ bool TransferNonTransferrableDiagnosticInferrer::run() {
              "All result info must be the same... if that changes... update "
              "this code!");
       SmallString<64> resultingName;
-      if (auto name = VariableNameInferrer::inferName(op->get())) {
+      if (auto name = inferNameHelper(op->get())) {
         diagnosticEmitter.emitNamedTransferringReturn(loc, *name);
         return true;
       }
@@ -1721,11 +2018,12 @@ void TransferNonSendableImpl::emitTransferredNonTransferrableDiagnostics() {
   if (transferredNonTransferrableInfoList.empty())
     return;
 
-  LLVM_DEBUG(
-      llvm::dbgs() << "Emitting transfer non transferrable diagnostics.\n");
+  REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                           << "Emitting Error. Kind: Send Never Sendable.\n");
 
   for (auto info : transferredNonTransferrableInfoList) {
-    TransferNonTransferrableDiagnosticInferrer diagnosticInferrer(info);
+    TransferNonTransferrableDiagnosticInferrer diagnosticInferrer(
+        regionInfo->getValueMap(), info);
     diagnosticInferrer.run();
   }
 }
@@ -1752,8 +2050,13 @@ public:
       emitUnknownPatternError();
   }
 
+  SILFunction *getFunction() const {
+    return info.inoutSendingParam->getFunction();
+  }
+
   std::optional<DiagnosticBehavior> getBehaviorLimit() const {
-    return getDiagnosticBehaviorLimitForValue(info.inoutSendingParam);
+    return info.inoutSendingParam->getType().getConcurrencyDiagnosticBehavior(
+        getFunction());
   }
 
   void emitUnknownPatternError() {
@@ -1817,7 +2120,7 @@ public:
 void InOutSendingNotDisconnectedDiagnosticEmitter::emit() {
   // We should always be able to find a name for an inout sending param. If we
   // do not, emit an unknown pattern error.
-  auto varName = VariableNameInferrer::inferName(info.inoutSendingParam);
+  auto varName = inferNameHelper(info.inoutSendingParam);
   if (!varName) {
     return emitUnknownPatternError();
   }
@@ -1871,8 +2174,11 @@ public:
       emitUnknownPatternError();
   }
 
-  std::optional<DiagnosticBehavior> getBehaviorLimit() const {
-    return getDiagnosticBehaviorLimitForValue(info.outSendingResult);
+  SILFunction *getFunction() const { return info.srcOperand->getFunction(); }
+
+  std::optional<DiagnosticBehavior> getConcurrencyDiagnosticBehavior() const {
+    return info.outSendingResult->getType().getConcurrencyDiagnosticBehavior(
+        getFunction());
   }
 
   void emitUnknownPatternError() {
@@ -1883,7 +2189,7 @@ public:
 
     diagnoseError(info.srcOperand->getUser(),
                   diag::regionbasedisolation_unknown_pattern)
-        .limitBehaviorIf(getBehaviorLimit());
+        .limitBehaviorIf(getConcurrencyDiagnosticBehavior());
   }
 
   void emit();
@@ -1982,7 +2288,8 @@ void AssignIsolatedIntoSendingResultDiagnosticEmitter::emit() {
     // string a path component for that class_method.
     if (info.srcOperand->get()->getType() != info.outSendingResult->getType()) {
       if (auto fas = FullApplySite::isa(info.srcOperand->getUser())) {
-        if (fas.getSelfArgument() == info.srcOperand->get() &&
+        if (fas.hasSelfArgument() &&
+            fas.getSelfArgument() == info.srcOperand->get() &&
             fas.getNumIndirectSILResults() == 1) {
           // First check if our function argument is exactly our out parameter.
           bool canEmit =
@@ -2018,7 +2325,7 @@ void AssignIsolatedIntoSendingResultDiagnosticEmitter::emit() {
         info.srcOperand,
         diag::regionbasedisolation_out_sending_cannot_be_actor_isolated_named,
         *varName, descriptiveKindStr)
-        .limitBehaviorIf(getBehaviorLimit());
+        .limitBehaviorIf(getConcurrencyDiagnosticBehavior());
 
     diagnoseNote(
         info.srcOperand,
@@ -2034,7 +2341,7 @@ void AssignIsolatedIntoSendingResultDiagnosticEmitter::emit() {
       info.srcOperand,
       diag::regionbasedisolation_out_sending_cannot_be_actor_isolated_type,
       type, descriptiveKindStr)
-      .limitBehaviorIf(getBehaviorLimit());
+      .limitBehaviorIf(getConcurrencyDiagnosticBehavior());
 
   diagnoseNote(
       info.srcOperand,
@@ -2121,14 +2428,15 @@ struct DiagnosticEvaluator final
     }
 
     auto rep = info->getValueMap().getRepresentative(transferredVal);
-    LLVM_DEBUG(llvm::dbgs()
-               << "    Emitting Use After Transfer Error!\n"
-               << "        Transferring Inst: " << *transferringOp->getUser()
-               << "        Transferring Op Value: " << transferringOp->get()
-               << "        Require Inst: " << *partitionOp.getSourceInst()
-               << "        ID:  %%" << transferredVal << "\n"
-               << "        Rep: " << *rep << "        Transferring Op Num: "
-               << transferringOp->getOperandNumber() << '\n');
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs()
+        << "    Emitting Error. Kind: Use After Send\n"
+        << "        Transferring Inst: " << *transferringOp->getUser()
+        << "        Transferring Op Value: " << transferringOp->get()
+        << "        Require Inst: " << *partitionOp.getSourceInst()
+        << "        ID:  %%" << transferredVal << "\n"
+        << "        Rep: " << *rep << "        Transferring Op Num: "
+        << transferringOp->getOperandNumber() << '\n');
     transferOpToRequireInstMultiMap.insert(
         transferringOp,
         RequireInst::forUseAfterTransfer(partitionOp.getSourceInst()));
@@ -2137,14 +2445,20 @@ struct DiagnosticEvaluator final
   void handleTransferNonTransferrable(
       const PartitionOp &partitionOp, Element transferredVal,
       SILDynamicMergedIsolationInfo isolationRegionInfo) const {
-    LLVM_DEBUG(llvm::dbgs()
-                   << "    Emitting TransferNonTransferrable Error!\n"
-                   << "        ID:  %%" << transferredVal << "\n"
-                   << "        Rep: "
-                   << *info->getValueMap().getRepresentative(transferredVal)
-                   << "        Dynamic Isolation Region: ";
-               isolationRegionInfo.printForDiagnostics(llvm::dbgs());
-               llvm::dbgs() << '\n');
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs() << "    Emitting Error. Kind: Send Non Sendable\n"
+                     << "        ID:  %%" << transferredVal << "\n"
+                     << "        Rep: "
+                     << *info->getValueMap().getRepresentative(transferredVal)
+                     << "        Dynamic Isolation Region: ";
+        isolationRegionInfo.printForOneLineLogging(llvm::dbgs());
+        llvm::dbgs() << '\n';
+        if (auto isolatedValue = isolationRegionInfo->maybeGetIsolatedValue()) {
+          llvm::dbgs() << "        Isolated Value: " << isolatedValue;
+          auto name = inferNameHelper(isolatedValue);
+          llvm::dbgs() << "        Isolated Value Name: "
+                       << (name.has_value() ? name->get() : "none") << '\n';
+        } else { llvm::dbgs() << "        Isolated Value: none\n"; });
     auto *self = const_cast<DiagnosticEvaluator *>(this);
     auto nonTransferrableValue =
         info->getValueMap().getRepresentative(transferredVal);
@@ -2156,15 +2470,16 @@ struct DiagnosticEvaluator final
   void handleInOutSendingNotDisconnectedAtExitError(
       const PartitionOp &partitionOp, Element inoutSendingVal,
       SILDynamicMergedIsolationInfo isolationRegionInfo) const {
-    LLVM_DEBUG(llvm::dbgs()
-                   << "    Emitting InOut Sending ActorIsolated at end of "
-                      "Function Error!\n"
-                   << "        ID:  %%" << inoutSendingVal << "\n"
-                   << "        Rep: "
-                   << *info->getValueMap().getRepresentative(inoutSendingVal)
-                   << "        Dynamic Isolation Region: ";
-               isolationRegionInfo.printForDiagnostics(llvm::dbgs());
-               llvm::dbgs() << '\n');
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs() << "    Emitting Error. Kind: InOut Sending ActorIsolated "
+                        "at end of "
+                        "Function Error!\n"
+                     << "        ID:  %%" << inoutSendingVal << "\n"
+                     << "        Rep: "
+                     << *info->getValueMap().getRepresentative(inoutSendingVal)
+                     << "        Dynamic Isolation Region: ";
+        isolationRegionInfo.printForOneLineLogging(llvm::dbgs());
+        llvm::dbgs() << '\n');
     auto *self = const_cast<DiagnosticEvaluator *>(this);
     auto nonTransferrableValue =
         info->getValueMap().getRepresentative(inoutSendingVal);
@@ -2178,30 +2493,30 @@ struct DiagnosticEvaluator final
       const PartitionOp &partitionOp, Element transferredVal,
       Element actualNonTransferrableValue,
       SILDynamicMergedIsolationInfo isolationRegionInfo) const {
-    LLVM_DEBUG(llvm::dbgs()
-                   << "    Emitting TransferNonTransferrable Error!\n"
-                   << "        ID:  %%" << transferredVal << "\n"
-                   << "        Rep: "
-                   << *info->getValueMap().getRepresentative(transferredVal)
-                   << "        Dynamic Isolation Region: ";
-               isolationRegionInfo.printForDiagnostics(llvm::dbgs());
-               llvm::dbgs() << '\n');
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs() << "    Emitting Error. Kind: Send Non Sendable\n"
+                     << "        ID:  %%" << transferredVal << "\n"
+                     << "        Rep: "
+                     << *info->getValueMap().getRepresentative(transferredVal)
+                     << "        Dynamic Isolation Region: ";
+        isolationRegionInfo.printForOneLineLogging(llvm::dbgs());
+        llvm::dbgs() << '\n');
 
     auto *self = const_cast<DiagnosticEvaluator *>(this);
     // If we have a non-actor introducing fake representative value, just use
     // the value that actually introduced the actor isolation.
     if (auto nonTransferrableValue = info->getValueMap().maybeGetRepresentative(
             actualNonTransferrableValue)) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "        ActualTransfer: " << nonTransferrableValue);
+      REGIONBASEDISOLATION_LOG(llvm::dbgs() << "        ActualTransfer: "
+                                            << nonTransferrableValue);
       self->transferredNonTransferrable.emplace_back(partitionOp.getSourceOp(),
                                                      nonTransferrableValue,
                                                      isolationRegionInfo);
     } else if (auto *nonTransferrableInst =
                    info->getValueMap().maybeGetActorIntroducingInst(
                        actualNonTransferrableValue)) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "        ActualTransfer: " << *nonTransferrableInst);
+      REGIONBASEDISOLATION_LOG(llvm::dbgs() << "        ActualTransfer: "
+                                            << *nonTransferrableInst);
       self->transferredNonTransferrable.emplace_back(
           partitionOp.getSourceOp(), nonTransferrableInst, isolationRegionInfo);
     } else {
@@ -2222,9 +2537,9 @@ struct DiagnosticEvaluator final
       SILFunctionArgument *destValue, Element srcElement, SILValue srcValue,
       SILDynamicMergedIsolationInfo srcIsolationRegionInfo) const {
     auto srcRep = info->getValueMap().getRepresentativeValue(srcElement);
-    LLVM_DEBUG(
+    REGIONBASEDISOLATION_LOG(
         llvm::dbgs()
-        << "    Emitting Error! Kind: Assign Isolated Into Sending Result!\n"
+        << "    Emitting Error. Kind: Assign Isolated Into Sending Result!\n"
         << "        Assign Inst: " << *partitionOp.getSourceInst()
         << "        Dest Value: " << *destValue
         << "        Dest Element: " << destElement << '\n'
@@ -2241,14 +2556,16 @@ struct DiagnosticEvaluator final
                                               Element inoutSendingVal,
                                               Operand *transferringOp) const {
     auto rep = info->getValueMap().getRepresentative(inoutSendingVal);
-    LLVM_DEBUG(llvm::dbgs()
-               << "    Emitting InOut Not Reinitialized At End Of Function!\n"
-               << "        Transferring Inst: " << *transferringOp->getUser()
-               << "        Transferring Op Value: " << transferringOp->get()
-               << "        Require Inst: " << *partitionOp.getSourceInst()
-               << "        ID:  %%" << inoutSendingVal << "\n"
-               << "        Rep: " << *rep << "        Transferring Op Num: "
-               << transferringOp->getOperandNumber() << '\n');
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs()
+        << "    Emitting Error. Kind: InOut Not Reinitialized At End Of "
+           "Function\n"
+        << "        Transferring Inst: " << *transferringOp->getUser()
+        << "        Transferring Op Value: " << transferringOp->get()
+        << "        Require Inst: " << *partitionOp.getSourceInst()
+        << "        ID:  %%" << inoutSendingVal << "\n"
+        << "        Rep: " << *rep << "        Transferring Op Num: "
+        << transferringOp->getOperandNumber() << '\n');
     transferOpToRequireInstMultiMap.insert(
         transferringOp, RequireInst::forInOutReinitializationNeeded(
                             partitionOp.getSourceInst()));
@@ -2307,17 +2624,19 @@ struct DiagnosticEvaluator final
 
 void TransferNonSendableImpl::runDiagnosticEvaluator() {
   // Then for each block...
-  LLVM_DEBUG(llvm::dbgs() << "Walking blocks for diagnostics.\n");
+  REGIONBASEDISOLATION_LOG(llvm::dbgs() << "Walking blocks for diagnostics.\n");
   for (auto [block, blockState] : regionInfo->getRange()) {
-    LLVM_DEBUG(llvm::dbgs() << "|--> Block bb" << block.getDebugID() << "\n");
+    REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                             << "|--> Block bb" << block.getDebugID() << "\n");
 
     if (!blockState.getLiveness()) {
-      LLVM_DEBUG(llvm::dbgs() << "Dead block... skipping!\n");
+      REGIONBASEDISOLATION_LOG(llvm::dbgs() << "Dead block... skipping!\n");
       continue;
     }
 
-    LLVM_DEBUG(llvm::dbgs() << "Entry Partition: ";
-               blockState.getEntryPartition().print(llvm::dbgs()));
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs() << "Entry Partition: ";
+        blockState.getEntryPartition().print(llvm::dbgs()));
 
     // Grab its entry partition and setup an evaluator for the partition that
     // has callbacks that emit diagnsotics...
@@ -2334,11 +2653,12 @@ void TransferNonSendableImpl::runDiagnosticEvaluator() {
       eval.apply(partitionOp);
     }
 
-    LLVM_DEBUG(llvm::dbgs() << "Exit Partition: ";
-               workingPartition.print(llvm::dbgs()));
+    REGIONBASEDISOLATION_LOG(llvm::dbgs() << "Exit Partition: ";
+                             workingPartition.print(llvm::dbgs()));
   }
 
-  LLVM_DEBUG(llvm::dbgs() << "Finished walking blocks for diagnostics.\n");
+  REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                           << "Finished walking blocks for diagnostics.\n");
 
   // Now that we have found all of our transferInsts/Requires emit errors.
   transferOpToRequireInstMultiMap.setFrozen();
@@ -2353,8 +2673,8 @@ void TransferNonSendableImpl::runDiagnosticEvaluator() {
 /// state.
 void TransferNonSendableImpl::emitDiagnostics() {
   auto *function = regionInfo->getFunction();
-  LLVM_DEBUG(llvm::dbgs() << "Emitting diagnostics for function "
-                          << function->getName() << "\n");
+  REGIONBASEDISOLATION_LOG(llvm::dbgs() << "Emitting diagnostics for function "
+                                        << function->getName() << "\n");
 
   runDiagnosticEvaluator();
   emitTransferredNonTransferrableDiagnostics();
@@ -2371,14 +2691,15 @@ class TransferNonSendable : public SILFunctionTransform {
 
     auto *functionInfo = getAnalysis<RegionAnalysis>()->get(function);
     if (!functionInfo->isSupportedFunction()) {
-      LLVM_DEBUG(llvm::dbgs() << "===> SKIPPING UNSUPPORTED FUNCTION: "
-                              << function->getName() << '\n');
+      REGIONBASEDISOLATION_LOG(llvm::dbgs()
+                               << "===> SKIPPING UNSUPPORTED FUNCTION: "
+                               << function->getName() << '\n');
 
       return;
     }
 
-    LLVM_DEBUG(llvm::dbgs()
-               << "===> PROCESSING: " << function->getName() << '\n');
+    REGIONBASEDISOLATION_LOG(
+        llvm::dbgs() << "===> PROCESSING: " << function->getName() << '\n');
 
     TransferNonSendableImpl impl(functionInfo);
     impl.emitDiagnostics();

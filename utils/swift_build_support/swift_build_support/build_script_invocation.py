@@ -670,8 +670,16 @@ class BuildScriptInvocation(object):
         builder.add_product(products.WasmSwiftSDK,
                             is_enabled=self.args.build_wasmstdlib)
 
+        builder.add_product(products.SwiftTestingMacros,
+                            is_enabled=self.args.build_swift_testing_macros)
+        builder.add_product(products.SwiftTesting,
+                            is_enabled=self.args.build_swift_testing)
         builder.add_product(products.SwiftPM,
                             is_enabled=self.args.build_swiftpm)
+        builder.add_product(products.SwiftFoundationTests,
+                            is_enabled=self.args.build_foundation)
+        builder.add_product(products.FoundationTests,
+                            is_enabled=self.args.build_foundation)
         builder.add_product(products.SwiftSyntax,
                             is_enabled=self.args.build_swiftsyntax)
         builder.add_product(products.SwiftFormat,

@@ -1643,6 +1643,13 @@ static bool performCompileStepsPostSILGen(CompilerInstance &Instance,
     return writeSIL(*SM, PSPs, Instance, Invocation.getSILOptions());
   }
 
+  // In lazy typechecking mode, SILGen may have triggered requests which
+  // resulted in errors. We don't want to proceed with optimization or
+  // serialization if there were errors since the SIL may be incomplete or
+  // invalid.
+  if (Context.TypeCheckerOpts.EnableLazyTypecheck && Context.hadError())
+    return true;
+
   if (Action == FrontendOptions::ActionType::EmitSIBGen) {
     serializeSIB(SM.get(), PSPs, Context, MSF);
     return Context.hadError();
@@ -1979,12 +1986,18 @@ int swift::performFrontend(ArrayRef<const char *> Args,
   auto configurationFileStackTraces =
       std::make_unique<std::optional<PrettyStackTraceFileContents>[]>(
           configurationFileBuffers.size());
-  for_each(configurationFileBuffers.begin(), configurationFileBuffers.end(),
-           &configurationFileStackTraces[0],
-           [](const std::unique_ptr<llvm::MemoryBuffer> &buffer,
-              std::optional<PrettyStackTraceFileContents> &trace) {
-             trace.emplace(*buffer);
-           });
+
+  // If the compile is a whole module job, then the contents of the filelist
+  // is every file in the module, which is not very interesting and could be
+  // hundreds or thousands of lines. Skip dumping this output in that case.
+  if (!Invocation.getFrontendOptions().InputsAndOutputs.isWholeModule()) {
+    for_each(configurationFileBuffers.begin(), configurationFileBuffers.end(),
+             &configurationFileStackTraces[0],
+             [](const std::unique_ptr<llvm::MemoryBuffer> &buffer,
+                std::optional<PrettyStackTraceFileContents> &trace) {
+               trace.emplace(*buffer);
+             });
+  }
 
   // The compiler invocation is now fully configured; notify our observer.
   if (observer) {
